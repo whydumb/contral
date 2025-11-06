@@ -253,9 +253,6 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         return new URDFModelOpenGLWithSTL(robot, modelDir);
     }
 
-    public URDFRobotModel getRobotModel() {
-        return robotModel;
-    }
 
     // ===== 내부 렌더링 =====
 
