@@ -15,7 +15,7 @@ import net.minecraft.client.renderer.RenderType;
 import net.minecraft.world.entity.Entity;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.joml.Matrix4f;
+import org.joml.Matrix4f;         // ※ 프로젝트가 바닐라 Matrix4f를 요구하면 com.mojang.math.Matrix4f로 교체
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
@@ -28,7 +28,7 @@ import java.util.*;
  * - 루트에서만 업라이트 보정(ROS/STL 좌표 → Minecraft) 1회 적용
  * - setJointPreview(...) 즉시 반영 + tickUpdate(...) 컨트롤러 추종
  * - setPreviewSkeleton(...) 주입 시 VRM 스켈레톤 라인 오버레이
- * - VRM도 URDF와 동일한 루트 변환을 적용하여 화면 중앙에서 정확히 겹쳐 보이도록 수정
+ * - VRM도 URDF와 동일한 루트 변환을 적용하여 화면 중앙에서 정확히 겹쳐 보이도록 구성
  */
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
@@ -54,8 +54,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     /** Minecraft 타깃 좌표계 (Up=+Y, Forward=±Z) */
     private static final boolean FORWARD_NEG_Z = true;             // 정면을 -Z(기본) / +Z
     private static final Vector3f DST_UP  = new Vector3f(0, 1, 0);
-    private static final Vector3f DST_FWD = FORWARD_NEG_Z ? new Vector3f(0, 0, -1)
-                                                          : new Vector3f(0, 0,  1);
+    private static final Vector3f DST_FWD = FORWARD_NEG_Z ? new Vector3f(0, 0, -1) : new Vector3f(0, 0,  1);
 
     /** 루트에서 1회만 적용하는 업라이트 보정 */
     private static final Quaternionf Q_ROS2MC = makeUprightQuat(SRC_UP, SRC_FWD, DST_UP, DST_FWD);
@@ -89,6 +88,11 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         // 컨트롤/모션 초기화
         this.ctrl = new URDFSimpleController(robotModel.joints);
         this.motionEditor = new URDFMotionEditor(robotModel, ctrl);
+
+        // ✅ 모델 폴더에서 VRM/GLB 자동 탐색 & 로드 (있으면 스켈레톤 오버레이 활성화)
+        try { loadVrmFromModelDir(); } catch (Throwable t) {
+            logger.info("[URDF] VRM auto-load skipped: {}", t.toString());
+        }
     }
 
     private void loadAllMeshes() {
@@ -163,6 +167,79 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             return names;
         }
         return Collections.emptyList();
+    }
+
+    // =======================================================
+    // ✅ VRM 로딩/관리 유틸 (추가)
+    // =======================================================
+
+    /** 현재 VRM 스켈레톤이 준비돼 있는지 */
+    public boolean hasVrm() { return vrmSkel != null; }
+
+    /** VRM/GLB 파일을 지정해서 로딩 */
+    public boolean loadVrm(File vrmOrGlb) {
+        if (vrmOrGlb == null || !vrmOrGlb.exists()) {
+            logger.warn("[URDF] VRM file not found: {}", (vrmOrGlb == null ? "null" : vrmOrGlb.getAbsolutePath()));
+            return false;
+        }
+        VrmSkeleton s = VrmLoader.load(vrmOrGlb);
+        if (s == null) {
+            logger.warn("[URDF] Failed to load VRM: {}", vrmOrGlb.getAbsolutePath());
+            return false;
+        }
+        setPreviewSkeleton(s); // IMMDModel 구현 메서드
+        logger.info("[URDF] VRM loaded: {} (profile={}, bones={})", vrmOrGlb.getName(), s.profile, s.bones.size());
+        return true;
+    }
+
+    /** 모델 디렉토리에서 .vrm/.glb 자동 탐색 후 로딩 */
+    public boolean loadVrmFromModelDir() {
+        if (modelDir == null) return false;
+        File base = new File(modelDir);
+        if (!base.isDirectory()) return false;
+
+        // 1) 우선순위 파일명
+        String[] prefer = { "avatar.vrm", "humanoid.vrm", "avatar.glb", "humanoid.glb" };
+        for (String n : prefer) {
+            File cand = new File(base, n);
+            if (cand.exists() && cand.isFile()) {
+                return loadVrm(cand);
+            }
+        }
+
+        // 2) 같은 폴더에서 .vrm/.glb
+        File[] list = base.listFiles((dir, name) -> {
+            String s = name.toLowerCase(Locale.ROOT);
+            return s.endsWith(".vrm") || s.endsWith(".glb");
+        });
+        if (list != null && list.length > 0) {
+            Arrays.sort(list);
+            return loadVrm(list[0]);
+        }
+
+        // 3) meshes/ 폴더에서 탐색
+        File meshes = new File(base, "meshes");
+        if (meshes.isDirectory()) {
+            File[] m = meshes.listFiles((dir, name) -> {
+                String s = name.toLowerCase(Locale.ROOT);
+                return s.endsWith(".vrm") || s.endsWith(".glb");
+            });
+            if (m != null && m.length > 0) {
+                Arrays.sort(m);
+                return loadVrm(m[0]);
+            }
+        }
+
+        logger.info("[URDF] No VRM/GLB avatar found under {}", base.getAbsolutePath());
+        return false;
+    }
+
+    /** 현재 VRM 해제(스틱맨/오버레이 비활성화) */
+    public void clearVrm() {
+        this.vrmSkel = null;
+        this.vrmLive.clear();
+        this.vrmRootCenter.set(0,0,0);
+        logger.info("[URDF] VRM cleared");
     }
 
     // ===== IMMDModel 구현 =====
