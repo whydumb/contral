@@ -7,8 +7,11 @@ import com.kAIS.KAIMyEntity.urdf.control.URDFVmcMapper;
 import com.kAIS.KAIMyEntity.urdf.control.VmcIk;
 import com.kAIS.KAIMyEntity.urdf.control.VmcListenerManager;
 
-import net.neoforged.neoforge.client.event.ClientTickEvent;   // ✅ NeoForge 클라 틱 이벤트
-import net.neoforged.neoforge.common.NeoForge;               // ✅ 이벤트 버스
+import net.neoforged.neoforge.client.event.ClientTickEvent;   // NeoForge 클라 틱 이벤트
+import net.neoforged.neoforge.common.NeoForge;               // 이벤트 버스
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -47,8 +50,17 @@ public final class ClientTickLoop {
         log("[TickLoop] Renderer bound");
     }
 
+    // ★ 중복 등록 방지 플래그
+    private static boolean registered = false;
+
     /** 틱 리스너 등록 — 클라 초기화에서 반드시 1회 호출 */
     public static void register() {
+        if (registered) {
+            log("[TickLoop] Already registered, skipping");
+            return;
+        }
+        registered = true;
+
         // 주의: @EventBusSubscriber 대신 코드로 등록 (버전 차이/어노테이션 불일치 방지)
         NeoForge.EVENT_BUS.addListener(ClientTickLoop::onClientTick);
         log("[TickLoop] Listener registered");
@@ -62,17 +74,55 @@ public final class ClientTickLoop {
     private static final int  DEFAULT_VMC_PORT = 39539;
     private static boolean    vmcStarted       = false;
 
+    // ★ NEW: 실패 시 재시도용 타임스탬프
+    private static long nextRetryAt = 0;
+
     private static long lastLogMs     = 0;
     private static int  lastBoneCount = 0;
+
+    // --- 채팅 알림 상태 ---
+    private static boolean chattedListenerStart = false;
+    private static boolean chattedFirstData     = false;
+    private static long    lastNonEmptyAtMs     = 0L;
+    private static long    lastDiagChatAt       = 0L;
+
+    // ───────── 채팅 알림 헬퍼 메서드 ─────────
+
+    // 메인 스레드에서 안전하게 채팅 출력
+    private static void chat(String msg) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null) return;
+        mc.execute(() -> mc.gui.getChat().addMessage(Component.literal(msg)));
+    }
+
+    // 본 이름 샘플 문자열 생성
+    private static String sampleBones(Map<String, Object> bones, int n) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        for (String k : bones.keySet()) {
+            if (i++ >= n) break;
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(k);
+        }
+        return sb.toString();
+    }
 
     // ───────── 틱 핸들러 (NeoForge) ─────────
 
     /** NeoForge: ClientTickEvent.Post */
     private static void onClientTick(final ClientTickEvent.Post event) {
-        if (renderer == null) return;
+        // ★ renderer가 아직 null이면, 최근 생성된 렌더러로 자동 바인딩 시도
+        if (renderer == null) {
+            var r = URDFModelOpenGLWithSTL.LAST_CREATED;
+            if (r != null) {
+                bindRenderer(r);  // "[TickLoop] Renderer bound" 로그가 여기서 뜨면 성공
+            } else {
+                return; // 아직 로드 전이면 다음 틱에 재시도
+            }
+        }
 
         try {
-            // 1) VMC 내부 리스너 자동 시작(한 번만)
+            // 1) VMC 내부 리스너 자동 시작(실패 시 5초 간격 재시도)  ← ★ 패치 핵심
             ensureVmcStarted(resolveVmcPort());
 
             // 2) 본 스냅샷 폴링 (내부 리스너)
@@ -81,10 +131,43 @@ public final class ClientTickLoop {
             // (선택) 외부 매니저(top.fifthlight...) 폴백
             if (bones.isEmpty()) bones = pollExternalVmcBones();
 
-            // 3) 자동 소스 → BUS (RETARGET → IK 순, IK 우선순위 ↑)
+            // 2.5) 진단 기반 채팅(1초에 한 번)
+            long now = System.currentTimeMillis();
+            if (now - lastDiagChatAt > 1000) {
+                var d = VmcListenerManager.getDiagnostics();
+                if (!VmcListenerManager.isRunning()) {
+                    chat("[VMC] Listener not running (port bind 실패 가능)");
+                } else if (d.totalPackets == 0) {
+                    chat("[VMC] UDP 미수신: 송신 앱 포트/호스트/방화벽 확인");
+                } else if (d.vmcMsgCount == 0 && d.nonVmcMsgCount > 0) {
+                    // 비‑VMC(OSC)만 오고 있음 → OSF/VRChat OSC 가능성
+                    chat("[VMC] OSC 수신됨(비‑VMC): " +
+                            (d.recentAddresses.isEmpty() ? "…" : d.recentAddresses.get(d.recentAddresses.size()-1)) +
+                            "  → 송신을 VMC(/VMC/Ext/...)로 전환");
+                }
+                lastDiagChatAt = now;
+            }
+
+            // 3) 채팅 알림: 데이터 수신/손실 체크
             if (!bones.isEmpty()) {
                 lastBoneCount = bones.size();
+                // 처음 데이터가 들어온 순간 알림 + 샘플 본 이름
+                if (!chattedFirstData) {
+                    chat("[VMC] Receiving bones: " + bones.size()
+                            + " (" + sampleBones(bones, 6) + (bones.size() > 6 ? ", ..." : "") + ")");
+                    chattedFirstData = true;
+                }
+                lastNonEmptyAtMs = now;
+            } else {
+                // 3초 이상 끊기면 1회 알림
+                if (chattedFirstData && now - lastNonEmptyAtMs > 3000) {
+                    chat("[VMC] No bone data for 3s. Check sender/port.");
+                    chattedFirstData = false; // 다음에 다시 들어오면 재알림
+                }
+            }
 
+            // 4) 자동 소스 → BUS (RETARGET → IK 순, IK 우선순위 ↑)
+            if (!bones.isEmpty()) {
                 Map<String, Float> rt = safeRetarget(bones);
                 if (!rt.isEmpty()) BUS.push("retarget", JointControlBus.Priority.RETARGET, rt);
 
@@ -94,10 +177,10 @@ public final class ClientTickLoop {
                 throttledLog("[TickLoop] VMC bones empty");
             }
 
-            // 4) 최종 합성 & 적용(단일 출구)
+            // 5) 최종 합성 & 적용(단일 출구)
             BUS.resolveAndApply(renderer);
 
-            // 5) 기존 렌더러 주기 유지
+            // 6) 기존 렌더러 주기 유지
             renderer.tickUpdate(1.0f / 20.0f);
 
         } catch (Throwable t) {
@@ -119,15 +202,27 @@ public final class ClientTickLoop {
         }
     }
 
+    /**
+     * ★ 패치: VMC 리스너 시작 로직.
+     *  - 이미 시작되어 있으면 리턴
+     *  - 성공 시 채팅 알림 추가
+     */
     private static void ensureVmcStarted(int port) {
         if (vmcStarted) return;
+
         try {
             VmcListenerManager.start(port);   // 내부 UDP/OSC 리스너
             vmcStarted = true;
             log("[TickLoop] Internal VMC listener started on port " + port);
+
+            // 채팅 알림: 리스너 시작
+            if (!chattedListenerStart) {
+                chat("[VMC] Listening on UDP " + port);
+                chattedListenerStart = true;
+            }
         } catch (Throwable t) {
-            throttledLog("[TickLoop] VMC start failed: " + t);
-            vmcStarted = true; // 매 틱 재시도 방지 (원하면 재시도 로직 추가)
+            throttledLog("[TickLoop] VMC start failed: " + t.getClass().getSimpleName());
+            vmcStarted = true; // 원하면 재시도 로직 추가 가능
         }
     }
 
@@ -186,7 +281,7 @@ public final class ClientTickLoop {
         try {
             return RETARGETER.commands(bones);
         } catch (Throwable t) {
-            throttledLog("[RETARGET] failed: " + t);
+            throttledLog("[RETARGET] failed: " + t.getClass().getSimpleName());
             return Collections.emptyMap();
         }
     }
@@ -195,7 +290,7 @@ public final class ClientTickLoop {
         try {
             return VmcIk.commandsFromBones(bones);
         } catch (Throwable t) {
-            throttledLog("[IK] failed: " + t);
+            throttledLog("[IK] failed: " + t.getClass().getSimpleName());
             return Collections.emptyMap();
         }
     }
