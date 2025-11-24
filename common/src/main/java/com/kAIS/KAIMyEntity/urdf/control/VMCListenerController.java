@@ -1,6 +1,5 @@
 package com.kAIS.KAIMyEntity.urdf.control;
 
-import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.kAIS.KAIMyEntity.webots.WebotsConfigScreen;
 import com.kAIS.KAIMyEntity.webots.WebotsController;
 import net.minecraft.client.Minecraft;
@@ -24,13 +23,11 @@ public class VMCListenerController extends Screen {
     private static final Component TITLE = Component.literal("RobotListener Control");
 
     private final Screen parent;
-    private final URDFModelOpenGLWithSTL renderer;
 
     private EditBox ipField;
     private EditBox portField;
     private Button connectButton;
     private Button toggleControlButton;
-    private Button openConfigButton;
     private Button closeButton;
 
     private WebotsController controller;
@@ -38,10 +35,9 @@ public class VMCListenerController extends Screen {
     private int statusColor = TEXT_COLOR;
     private int refreshTicker = 0;
 
-    public VMCListenerController(Screen parent, URDFModelOpenGLWithSTL renderer) {
+    public VMCListenerController(Screen parent) {
         super(TITLE);
         this.parent = parent;
-        this.renderer = renderer;
     }
 
     @Override
@@ -53,37 +49,47 @@ public class VMCListenerController extends Screen {
 
         int panelWidth = 240;
         int centerX = this.width / 2;
-        int startY = this.height / 2 - 60;
+        int startY = this.height / 2 - 50;
 
-        this.ipField = new EditBox(this.font, centerX - panelWidth / 2, startY, panelWidth, 20,
+        // IP 입력
+        this.ipField = new EditBox(this.font,
+                centerX - panelWidth / 2,
+                startY,
+                panelWidth,
+                20,
                 Component.literal("IP Address"));
         this.ipField.setValue(config.getLastIp());
         this.ipField.setMaxLength(64);
         addRenderableWidget(this.ipField);
 
-        this.portField = new EditBox(this.font, centerX - panelWidth / 2, startY + 26, panelWidth, 20,
+        // Port 입력
+        this.portField = new EditBox(this.font,
+                centerX - panelWidth / 2,
+                startY + 26,
+                panelWidth,
+                20,
                 Component.literal("Port"));
         this.portField.setValue(String.valueOf(config.getLastPort()));
         this.portField.setMaxLength(5);
         addRenderableWidget(this.portField);
 
-        this.connectButton = Button.builder(Component.literal("Connect / Reconnect"), button -> handleConnect())
+        // Connect 버튼
+        this.connectButton = Button.builder(Component.literal("Connect / Reconnect"),
+                        button -> handleConnect())
                 .bounds(centerX - panelWidth / 2, startY + 52, panelWidth, 20)
                 .build();
         addRenderableWidget(this.connectButton);
 
-        this.toggleControlButton = Button.builder(Component.literal("Enable Robot Control"), button -> handleToggleRobotControl())
+        // Robot Control 토글 버튼 (WASD + Mouse 전송 on/off)
+        this.toggleControlButton = Button.builder(Component.literal("Enable Robot Control"),
+                        button -> handleToggleRobotControl())
                 .bounds(centerX - panelWidth / 2, startY + 78, panelWidth, 20)
                 .build();
         addRenderableWidget(this.toggleControlButton);
 
-        this.openConfigButton = Button.builder(Component.literal("Open Advanced Settings"), button ->
-                Minecraft.getInstance().setScreen(new WebotsConfigScreen(this)))
-                .bounds(centerX - panelWidth / 2, startY + 104, panelWidth, 20)
-                .build();
-        addRenderableWidget(this.openConfigButton);
-
-        this.closeButton = Button.builder(Component.literal("Close"), button -> onClose())
+        // Close 버튼
+        this.closeButton = Button.builder(Component.literal("Close"),
+                        button -> onClose())
                 .bounds(centerX - 50, this.height - 32, 100, 20)
                 .build();
         addRenderableWidget(this.closeButton);
@@ -102,6 +108,7 @@ public class VMCListenerController extends Screen {
             portField.tick();
         }
 
+        // 1초마다 상태 갱신
         if (++refreshTicker >= 20) {
             refreshTicker = 0;
             controller = tryGetController();
@@ -112,48 +119,54 @@ public class VMCListenerController extends Screen {
 
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+        // 배경
         graphics.fill(0, 0, this.width, this.height, BG_COLOR);
 
-        int panelX = this.width / 2 - 150;
-        int panelY = this.height / 2 - 90;
+        // 패널
         int panelW = 300;
-        int panelH = 180;
+        int panelH = 150;
+        int panelX = this.width / 2 - panelW / 2;
+        int panelY = this.height / 2 - panelH / 2;
         graphics.fill(panelX, panelY, panelX + panelW, panelY + panelH, PANEL_COLOR);
 
         super.render(graphics, mouseX, mouseY, partialTick);
 
-        graphics.drawCenteredString(this.font, TITLE.getString(), this.width / 2, panelY - 18, TITLE_COLOR);
+        // 타이틀
+        graphics.drawCenteredString(this.font, TITLE.getString(),
+                this.width / 2, panelY - 18, TITLE_COLOR);
+
+        // 라벨
         graphics.drawString(this.font, "IP Address", panelX + 10, panelY + 8, TEXT_COLOR, false);
         graphics.drawString(this.font, "Port", panelX + 10, panelY + 34, TEXT_COLOR, false);
 
+        // 상태 표시
         if (controller != null) {
-            int statusY = panelY + 132;
+            int statusY = panelY + 90;
+
             boolean connected = controller.isConnected();
-            String connection = connected ? "● Connected" : "● Disconnected";
-            graphics.drawCenteredString(this.font, connection, this.width / 2, statusY,
+            String connection = connected
+                    ? "● Connected to " + controller.getRobotAddress()
+                    : "● Disconnected";
+
+            graphics.drawCenteredString(this.font, connection,
+                    this.width / 2, statusY,
                     connected ? OK_COLOR : WARN_COLOR);
 
-            WebotsController.Mode mode = controller.getMode();
-            String modeLabel = "Mode: " + (mode == WebotsController.Mode.ROBOTLISTENER ? "RobotListener" : "Webots");
-            graphics.drawCenteredString(this.font, modeLabel, this.width / 2, statusY + 12, TEXT_COLOR);
+            String controlLabel = controller.isRobotListenerEnabled()
+                    ? "Robot control: ENABLED (WASD + Mouse)"
+                    : "Robot control: DISABLED";
+            graphics.drawCenteredString(this.font, controlLabel,
+                    this.width / 2, statusY + 12, TEXT_COLOR);
 
-            if (renderer != null && renderer.getRobotModel() != null) {
-                graphics.drawCenteredString(this.font, "Robot: " + renderer.getRobotModel().name,
-                        this.width / 2, statusY + 24, TEXT_COLOR);
-            }
-
-            if (controller.isRobotListenerEnabled()) {
-                graphics.drawString(this.font, "Controls:", panelX + 10, statusY - 48, TITLE_COLOR, false);
-                graphics.drawString(this.font, "• WASD - Translate", panelX + 14, statusY - 33, TEXT_COLOR, false);
-                graphics.drawString(this.font, "• Mouse - Head aim", panelX + 14, statusY - 20, TEXT_COLOR, false);
-            }
         } else {
-            graphics.drawCenteredString(this.font, "Controller not initialized", this.width / 2,
-                    panelY + 132, WARN_COLOR);
+            graphics.drawCenteredString(this.font, "Controller not initialized",
+                    this.width / 2, panelY + 90, WARN_COLOR);
         }
 
+        // 하단 상태 메시지
         if (!statusMessage.isEmpty()) {
-            graphics.drawCenteredString(this.font, statusMessage, this.width / 2, panelY + panelH + 12, statusColor);
+            graphics.drawCenteredString(this.font, statusMessage,
+                    this.width / 2, panelY + panelH + 12, statusColor);
         }
     }
 
@@ -179,11 +192,11 @@ public class VMCListenerController extends Screen {
 
         try {
             controller = WebotsController.getInstance(ip, port);
-            setStatus("Connected to " + controller.getRobotAddress(), OK_COLOR);
+            setStatus("Target set to " + controller.getRobotAddress(), OK_COLOR);
             WebotsConfigScreen.Config.getInstance().update(ip, port);
         } catch (Exception e) {
-            LOGGER.error("Failed to connect to {}:{}", ip, port, e);
-            setStatus("Connection failed: " + e.getMessage(), WARN_COLOR);
+            LOGGER.error("Failed to set target {}:{}", ip, port, e);
+            setStatus("Connection setup failed: " + e.getMessage(), WARN_COLOR);
         }
 
         updateToggleButtonText();
@@ -197,13 +210,9 @@ public class VMCListenerController extends Screen {
             return;
         }
 
-        if (!controller.isConnected()) {
-            setStatus("Controller is not connected.", WARN_COLOR);
-            return;
-        }
-
         boolean enable = !controller.isRobotListenerEnabled();
         controller.enableRobotListener(enable);
+
         if (enable) {
             setStatus("Robot control enabled. Use WASD + Mouse.", OK_COLOR);
         } else {
@@ -215,26 +224,21 @@ public class VMCListenerController extends Screen {
     }
 
     private void updateButtonStates() {
-        if (toggleControlButton == null) {
-            return;
-        }
+        if (toggleControlButton == null) return;
 
         boolean hasController = controller != null;
-        boolean connected = hasController && controller.isConnected();
 
-        toggleControlButton.active = connected;
+        // Robot control 토글은 컨트롤러만 있으면 활성
+        toggleControlButton.active = hasController;
+
         if (connectButton != null) {
             connectButton.active = true;
-        }
-        if (openConfigButton != null) {
-            openConfigButton.active = true;
         }
     }
 
     private void updateToggleButtonText() {
-        if (toggleControlButton == null) {
-            return;
-        }
+        if (toggleControlButton == null) return;
+
         if (controller != null && controller.isRobotListenerEnabled()) {
             toggleControlButton.setMessage(Component.literal("Disable Robot Control"));
         } else {
