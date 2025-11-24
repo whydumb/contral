@@ -14,12 +14,10 @@ import java.io.*;
 import java.util.Properties;
 
 /**
- * Webots 연결 설정 GUI + 설정 관리
- * - IP 주소 변경
- * - 포트 변경
- * - 연결 테스트
- * - 통계 확인
- * - 설정 자동 저장/로드
+ * 통합 Webots 설정 GUI
+ * - Webots/RobotListener 연결 설정
+ * - 모드 전환 (Webots ↔ RobotListener)
+ * - 실시간 통계
  */
 public class WebotsConfigScreen extends Screen {
     private static final Logger LOGGER = LogManager.getLogger();
@@ -39,6 +37,7 @@ public class WebotsConfigScreen extends Screen {
     private EditBox ipBox;
     private EditBox portBox;
     private Button connectButton;
+    private Button modeButton;
     private Button testButton;
     private Button closeButton;
     
@@ -47,7 +46,7 @@ public class WebotsConfigScreen extends Screen {
     private int autoRefreshTicker = 0;
     
     public WebotsConfigScreen(Screen parent) {
-        super(Component.literal("Webots Connection Settings"));
+        super(Component.literal("Webots/RobotListener Settings"));
         this.parent = parent;
         
         try {
@@ -64,11 +63,10 @@ public class WebotsConfigScreen extends Screen {
         int centerX = this.width / 2;
         int startY = 80;
         
-        // === IP 주소 입력 ===
+        // IP 주소 입력
         this.ipBox = new EditBox(this.font, centerX - 100, startY, 200, 20, 
                 Component.literal("IP Address"));
         
-        // ✅ Config에서 마지막 저장된 IP 로드
         Config config = Config.getInstance();
         this.ipBox.setValue(config.getLastIp());
         this.ipBox.setMaxLength(50);
@@ -76,18 +74,16 @@ public class WebotsConfigScreen extends Screen {
         
         startY += 30;
         
-        // === 포트 입력 ===
+        // 포트 입력
         this.portBox = new EditBox(this.font, centerX - 100, startY, 200, 20,
                 Component.literal("Port"));
-        
-        // ✅ Config에서 마지막 저장된 Port 로드
         this.portBox.setValue(String.valueOf(config.getLastPort()));
         this.portBox.setMaxLength(5);
         addRenderableWidget(this.portBox);
         
         startY += 35;
         
-        // === 연결/재연결 버튼 ===
+        // 연결/재연결 버튼
         this.connectButton = Button.builder(Component.literal("Connect / Reconnect"), b -> {
             handleConnect();
         }).bounds(centerX - 100, startY, 200, 20).build();
@@ -95,13 +91,22 @@ public class WebotsConfigScreen extends Screen {
         
         startY += 25;
         
-        // === T-Pose 테스트 버튼 ===
+        // 모드 전환 버튼
+        updateModeButtonText();
+        this.modeButton = Button.builder(Component.literal("Mode: Webots"), b -> {
+            handleModeToggle();
+        }).bounds(centerX - 100, startY, 200, 20).build();
+        addRenderableWidget(this.modeButton);
+        
+        startY += 25;
+        
+        // T-Pose 테스트 버튼
         this.testButton = Button.builder(Component.literal("Test T-Pose"), b -> {
             handleTest();
         }).bounds(centerX - 100, startY, 200, 20).build();
         addRenderableWidget(this.testButton);
         
-        // === 닫기 버튼 ===
+        // 닫기 버튼
         this.closeButton = Button.builder(Component.literal("Close"), b -> {
             Minecraft.getInstance().setScreen(parent);
         }).bounds(centerX - 50, this.height - 30, 100, 20).build();
@@ -139,13 +144,44 @@ public class WebotsConfigScreen extends Screen {
                 setStatus("✓ Reconnected to " + ip + ":" + port, CONNECTED_COLOR);
             }
             
-            // ✅ Config에 저장
             Config.getInstance().update(ip, port);
             
-            LOGGER.info("Connected to Webots: {}:{}", ip, port);
+            LOGGER.info("Connected to server: {}:{}", ip, port);
         } catch (Exception e) {
             setStatus("✗ Connection failed: " + e.getMessage(), DISCONNECTED_COLOR);
-            LOGGER.error("Failed to connect to Webots", e);
+            LOGGER.error("Failed to connect", e);
+        }
+    }
+    
+    private void handleModeToggle() {
+        if (controller == null) {
+            setStatus("✗ Not connected. Click 'Connect' first.", DISCONNECTED_COLOR);
+            return;
+        }
+        
+        if (!controller.isConnected()) {
+            setStatus("✗ Connection lost. Try reconnecting.", DISCONNECTED_COLOR);
+            return;
+        }
+        
+        try {
+            WebotsController.Mode currentMode = controller.getMode();
+            
+            if (currentMode == WebotsController.Mode.WEBOTS) {
+                // Webots → RobotListener
+                controller.enableRobotListener(true);
+                setStatus("✓ Mode: RobotListener (WASD + Mouse)", CONNECTED_COLOR);
+            } else {
+                // RobotListener → Webots
+                controller.enableRobotListener(false);
+                setStatus("✓ Mode: Webots (URDF Joint Control)", CONNECTED_COLOR);
+            }
+            
+            updateModeButtonText();
+            
+        } catch (Exception e) {
+            setStatus("✗ Mode switch failed: " + e.getMessage(), DISCONNECTED_COLOR);
+            LOGGER.error("Mode switch failed", e);
         }
     }
     
@@ -170,11 +206,21 @@ public class WebotsConfigScreen extends Screen {
             controller.setJoint("l_sho_roll", -1.57f);
             controller.setJoint("l_el", -0.1f);
             
-            setStatus("✓ T-Pose sent! Check Webots simulation.", CONNECTED_COLOR);
+            setStatus("✓ T-Pose sent! Check simulation.", CONNECTED_COLOR);
             LOGGER.info("T-Pose test sent successfully");
         } catch (Exception e) {
             setStatus("✗ Test failed: " + e.getMessage(), DISCONNECTED_COLOR);
             LOGGER.error("T-Pose test failed", e);
+        }
+    }
+    
+    private void updateModeButtonText() {
+        if (controller != null && modeButton != null) {
+            WebotsController.Mode mode = controller.getMode();
+            String text = mode == WebotsController.Mode.WEBOTS 
+                ? "Mode: Webots → RobotListener" 
+                : "Mode: RobotListener → Webots";
+            modeButton.setMessage(Component.literal(text));
         }
     }
     
@@ -188,6 +234,7 @@ public class WebotsConfigScreen extends Screen {
         boolean connected = hasController && controller.isConnected();
         
         testButton.active = connected;
+        modeButton.active = connected;
     }
     
     @Override
@@ -207,7 +254,7 @@ public class WebotsConfigScreen extends Screen {
         // 제목
         graphics.pose().pushPose();
         graphics.pose().translate(0, 0, 1000.0f);
-        graphics.drawCenteredString(this.font, "Webots Connection Settings", 
+        graphics.drawCenteredString(this.font, "Webots/RobotListener Settings", 
                 this.width / 2, 20, TITLE_COLOR);
         
         // 라벨
@@ -215,9 +262,11 @@ public class WebotsConfigScreen extends Screen {
         graphics.drawString(this.font, "Port:", this.width / 2 - 100, 98, TEXT_COLOR, false);
         
         // 연결 상태
-        int statusY = 145;
+        int statusY = 195;
         if (controller != null) {
             boolean connected = controller.isConnected();
+            WebotsController.Mode mode = controller.getMode();
+            
             String connStatus = connected ? "§a● CONNECTED" : "§c● DISCONNECTED";
             graphics.drawCenteredString(this.font, connStatus, this.width / 2, statusY, 
                     connected ? CONNECTED_COLOR : DISCONNECTED_COLOR);
@@ -226,6 +275,10 @@ public class WebotsConfigScreen extends Screen {
                 String address = "Address: " + controller.getRobotAddress();
                 graphics.drawCenteredString(this.font, address, this.width / 2, 
                         statusY + 12, TEXT_COLOR);
+                
+                String modeStr = "Mode: " + (mode == WebotsController.Mode.WEBOTS ? "Webots" : "RobotListener");
+                graphics.drawCenteredString(this.font, modeStr, this.width / 2, 
+                        statusY + 24, TITLE_COLOR);
             }
         } else {
             graphics.drawCenteredString(this.font, "§c● NOT INITIALIZED", 
@@ -235,22 +288,37 @@ public class WebotsConfigScreen extends Screen {
         // 상태 메시지
         if (!statusMessage.isEmpty()) {
             graphics.drawCenteredString(this.font, statusMessage, 
-                    this.width / 2, statusY + 30, statusColor);
+                    this.width / 2, statusY + 45, statusColor);
         }
         
         // 통계 패널
         if (controller != null && controller.isConnected()) {
-            int statsY = statusY + 55;
+            int statsY = statusY + 75;
             graphics.drawString(this.font, "=== Statistics ===", 
                     panelX + 20, statsY, TITLE_COLOR, false);
             
-            String statsJson = controller.getStatsJson();
-            if (!statsJson.contains("error")) {
-                graphics.drawString(this.font, "Server: OK", 
-                        panelX + 20, statsY + 15, CONNECTED_COLOR, false);
+            if (controller.getMode() == WebotsController.Mode.ROBOTLISTENER) {
+                graphics.drawString(this.font, "Walk commands: " + controller.getWalkSent(), 
+                        panelX + 20, statsY + 15, TEXT_COLOR, false);
+                graphics.drawString(this.font, "Head commands: " + controller.getHeadSent(), 
+                        panelX + 20, statsY + 30, TEXT_COLOR, false);
+                graphics.drawString(this.font, "Errors: " + controller.getErrors(), 
+                        panelX + 20, statsY + 45, 
+                        controller.getErrors() > 0 ? DISCONNECTED_COLOR : CONNECTED_COLOR, false);
+                
+                // 사용법
+                int helpY = statsY + 70;
+                graphics.drawString(this.font, "=== Controls ===", 
+                        panelX + 20, helpY, TITLE_COLOR, false);
+                graphics.drawString(this.font, "• WASD: Move robot", 
+                        panelX + 20, helpY + 15, 0xFFAAAAAA, false);
+                graphics.drawString(this.font, "• Mouse: Aim head", 
+                        panelX + 20, helpY + 30, 0xFFAAAAAA, false);
             } else {
-                graphics.drawString(this.font, "Server: " + statsJson, 
-                        panelX + 20, statsY + 15, DISCONNECTED_COLOR, false);
+                graphics.drawString(this.font, "URDF Joint Control Active", 
+                        panelX + 20, statsY + 15, CONNECTED_COLOR, false);
+                graphics.drawString(this.font, "Use U key to toggle mode", 
+                        panelX + 20, statsY + 30, 0xFFAAAAAA, false);
             }
         }
         
@@ -260,13 +328,8 @@ public class WebotsConfigScreen extends Screen {
         if (++autoRefreshTicker >= 20) {
             autoRefreshTicker = 0;
             updateButtonStates();
+            updateModeButtonText();
         }
-    }
-    
-    @Override
-    public void tick() {
-        super.tick();
-        // EditBox.tick() removed in modern versions
     }
     
     @Override
@@ -280,30 +343,17 @@ public class WebotsConfigScreen extends Screen {
     }
     
     // ========================================================================
-    // ✅ 내부 Config 클래스 (WebotsConfig.java 내용 통합)
+    // Config 클래스
     // ========================================================================
     
-    /**
-     * Webots 연결 설정 관리 (내부 클래스)
-     * - 기본 IP/Port 저장 및 로드
-     * - 마지막 연결 정보 기억
-     * - 설정 파일 자동 생성
-     */
     public static class Config {
         private static final Logger CONFIG_LOGGER = LogManager.getLogger();
-        
-        // 기본값
         private static final String DEFAULT_IP = "localhost";
         private static final int DEFAULT_PORT = 8080;
         
-        // 현재 설정값
         private String lastIp;
         private int lastPort;
-        
-        // 설정 파일 경로
         private final File configFile;
-        
-        // 싱글톤
         private static Config instance;
         
         private Config() {
@@ -313,8 +363,6 @@ public class WebotsConfigScreen extends Screen {
                 configDir.mkdirs();
             }
             this.configFile = new File(configDir, "webots_connection.properties");
-            
-            // 설정 로드
             load();
         }
         
@@ -325,16 +373,12 @@ public class WebotsConfigScreen extends Screen {
             return instance;
         }
         
-        /**
-         * 설정 파일에서 로드
-         */
         private void load() {
             if (!configFile.exists()) {
-                // 파일 없으면 기본값 사용
                 lastIp = DEFAULT_IP;
                 lastPort = DEFAULT_PORT;
-                save(); // 기본값으로 파일 생성
-                CONFIG_LOGGER.info("Created default Webots config: {}:{}", lastIp, lastPort);
+                save();
+                CONFIG_LOGGER.info("Created default config: {}:{}", lastIp, lastPort);
                 return;
             }
             
@@ -343,17 +387,14 @@ public class WebotsConfigScreen extends Screen {
                 props.load(fis);
                 lastIp = props.getProperty("ip", DEFAULT_IP);
                 lastPort = Integer.parseInt(props.getProperty("port", String.valueOf(DEFAULT_PORT)));
-                CONFIG_LOGGER.info("Loaded Webots config: {}:{}", lastIp, lastPort);
+                CONFIG_LOGGER.info("Loaded config: {}:{}", lastIp, lastPort);
             } catch (Exception e) {
-                CONFIG_LOGGER.warn("Failed to load Webots config, using defaults", e);
+                CONFIG_LOGGER.warn("Failed to load config, using defaults", e);
                 lastIp = DEFAULT_IP;
                 lastPort = DEFAULT_PORT;
             }
         }
         
-        /**
-         * 설정 파일에 저장
-         */
         public void save() {
             Properties props = new Properties();
             props.setProperty("ip", lastIp);
@@ -361,36 +402,19 @@ public class WebotsConfigScreen extends Screen {
             
             try (FileOutputStream fos = new FileOutputStream(configFile)) {
                 props.store(fos, "Webots Connection Settings");
-                CONFIG_LOGGER.info("Saved Webots config: {}:{}", lastIp, lastPort);
+                CONFIG_LOGGER.info("Saved config: {}:{}", lastIp, lastPort);
             } catch (Exception e) {
-                CONFIG_LOGGER.error("Failed to save Webots config", e);
+                CONFIG_LOGGER.error("Failed to save config", e);
             }
         }
         
-        /**
-         * 현재 설정 업데이트 및 저장
-         */
         public void update(String ip, int port) {
             this.lastIp = ip;
             this.lastPort = port;
             save();
         }
         
-        // Getters
-        public String getLastIp() {
-            return lastIp;
-        }
-        
-        public int getLastPort() {
-            return lastPort;
-        }
-        
-        public String getDefaultIp() {
-            return DEFAULT_IP;
-        }
-        
-        public int getDefaultPort() {
-            return DEFAULT_PORT;
-        }
+        public String getLastIp() { return lastIp; }
+        public int getLastPort() { return lastPort; }
     }
 }
