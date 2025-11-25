@@ -1,4 +1,3 @@
-// common/src/main/java/com/kAIS/KAIMyEntity/webots/WebotsController.java
 package com.kAIS.KAIMyEntity.webots;
 
 import net.minecraft.client.Minecraft;
@@ -19,12 +18,16 @@ import java.util.concurrent.CompletableFuture;
  * 역할:
  *  - Minecraft WASD + 마우스 에임을 읽어서
  *  - RobotListener HTTP 서버로 set_walk, set_head 명령 전송
- *
- * 불필요한 Webots 조인트 제어, 큐, 스케줄러 등 전부 제거.
  */
 public class WebotsController {
     private static final Logger LOGGER = LogManager.getLogger();
     private static WebotsController instance;
+
+    // ==================== Mode enum ====================
+    public enum Mode {
+        WEBOTS,
+        ROBOTLISTENER
+    }
 
     // ==================== 네트워크 설정 ====================
     private final HttpClient httpClient;
@@ -36,6 +39,11 @@ public class WebotsController {
 
     // ==================== RobotListener 관련 ====================
     private boolean robotListenerEnabled = false;
+    
+    // ==================== 통계 ====================
+    private int walkSent = 0;
+    private int headSent = 0;
+    private int errors = 0;
 
     // WASD 이전 상태
     private boolean lastF = false, lastB = false, lastL = false, lastR = false;
@@ -48,7 +56,7 @@ public class WebotsController {
     private boolean forceHeadUpdate = true;
 
     // 민감도 (도 단위 기준)
-    private static final float YAW_SENSITIVITY_DEG = 0.57f;   // ≒ 0.01rad
+    private static final float YAW_SENSITIVITY_DEG = 0.57f;
     private static final float PITCH_SENSITIVITY_DEG = 0.57f;
 
     // 모터 범위 (rad)
@@ -68,12 +76,9 @@ public class WebotsController {
                 .connectTimeout(Duration.ofMillis(500))
                 .build();
 
-        LOGGER.info("WebotsController (RobotListener-only) initialized: {}", serverUrl);
+        LOGGER.info("WebotsController initialized: {}", serverUrl);
     }
 
-    /**
-     * Config에 저장된 마지막 IP/Port로 인스턴스 생성/반환
-     */
     public static WebotsController getInstance() {
         if (instance == null) {
             try {
@@ -87,9 +92,6 @@ public class WebotsController {
         return instance;
     }
 
-    /**
-     * 주어진 IP/Port로 인스턴스 생성/재생성
-     */
     public static WebotsController getInstance(String ip, int port) {
         if (instance != null) {
             if (!instance.serverIp.equals(ip) || instance.serverPort != port) {
@@ -115,6 +117,12 @@ public class WebotsController {
         return instance;
     }
 
+    // ==================== Mode 관련 ====================
+
+    public Mode getMode() {
+        return robotListenerEnabled ? Mode.ROBOTLISTENER : Mode.WEBOTS;
+    }
+
     // ==================== RobotListener on/off ====================
 
     public void enableRobotListener(boolean enable) {
@@ -123,7 +131,6 @@ public class WebotsController {
             primeRobotListenerInputs();
             LOGGER.info("RobotListener mode ENABLED");
         } else {
-            // 긴급 정지
             sendStopAll();
             forceWalkUpdate = true;
             forceHeadUpdate = true;
@@ -135,12 +142,46 @@ public class WebotsController {
         return robotListenerEnabled;
     }
 
+    // ==================== 통계 Getter ====================
+
+    public int getWalkSent() {
+        return walkSent;
+    }
+
+    public int getHeadSent() {
+        return headSent;
+    }
+
+    public int getErrors() {
+        return errors;
+    }
+
+    public void printStats() {
+        LOGGER.info("=== WebotsController Stats ===");
+        LOGGER.info("Connected: {}", connected);
+        LOGGER.info("Mode: {}", getMode());
+        LOGGER.info("Walk commands sent: {}", walkSent);
+        LOGGER.info("Head commands sent: {}", headSent);
+        LOGGER.info("Errors: {}", errors);
+    }
+
+    // ==================== Joint Control (Webots mode) ====================
+
+    public void setJoint(String jointName, float value) {
+        if (!connected) return;
+        
+        String url = String.format("%s/?command=set_joint&name=%s&value=%.4f", 
+                serverUrl, jointName, value);
+        
+        sendAsyncDirect(url).thenAccept(success -> {
+            if (!success) {
+                errors++;
+            }
+        });
+    }
+
     // ==================== 매 틱 호출 (WASD + 마우스 읽어서 전송) ====================
 
-    /**
-     * 매 틱마다 호출해줘야 함.
-     * (예: ClientTickEvent, 혹은 별도 클라이언트 이벤트 핸들러에서)
-     */
     public void tick() {
         if (!robotListenerEnabled) {
             return;
@@ -152,17 +193,14 @@ public class WebotsController {
         LocalPlayer player = mc.player;
         if (player == null) return;
 
-        // WASD 키 상태
         boolean f = mc.options.keyUp.isDown();
         boolean b = mc.options.keyDown.isDown();
         boolean l = mc.options.keyLeft.isDown();
         boolean r = mc.options.keyRight.isDown();
 
-        // 마우스 에임 (deg)
         float yaw = player.getYRot();
         float pitch = player.getXRot();
 
-        // 1) WASD 변화 감지 → set_walk
         boolean walkChanged = forceWalkUpdate || f != lastF || b != lastB || l != lastL || r != lastR;
         if (walkChanged) {
             sendWalkCommand(f, b, l, r);
@@ -177,7 +215,6 @@ public class WebotsController {
             }
         }
 
-        // 2) 마우스 에임 변화 감지 → set_head
         float yawDelta = Math.abs(yaw - lastYaw);
         float pitchDelta = Math.abs(pitch - lastPitch);
 
@@ -197,9 +234,6 @@ public class WebotsController {
         }
     }
 
-    /**
-     * RobotListener 활성화 시, 현재 입력값으로 초기화
-     */
     private void primeRobotListenerInputs() {
         forceWalkUpdate = true;
         forceHeadUpdate = true;
@@ -229,10 +263,6 @@ public class WebotsController {
 
     // ==================== RobotListener HTTP 명령 ====================
 
-    /**
-     * WASD 명령 전송
-     *   /?command=set_walk&f=0/1&b=0/1&l=0/1&r=0/1
-     */
     private void sendWalkCommand(boolean f, boolean b, boolean l, boolean r) {
         String url = String.format(
                 "%s/?command=set_walk&f=%d&b=%d&l=%d&r=%d",
@@ -244,21 +274,16 @@ public class WebotsController {
         );
 
         sendAsyncDirect(url).thenAccept(success -> {
-            if (!success) {
-                LOGGER.debug("set_walk failed");
+            if (success) {
+                walkSent++;
+            } else {
+                errors++;
             }
         });
     }
 
-    /**
-     * 마우스 에임 → head(yaw, pitch) 전송
-     *   /?command=set_head&yaw=rad&pitch=rad
-     */
     private void sendHeadCommand(float yawDeg, float pitchDeg) {
-        // Minecraft yaw: 좌(-) / 우(+) 기준, 그대로 rad 변환
         float yawRad = (float) Math.toRadians(yawDeg);
-
-        // pitch: 위(-) / 아래(+) 이라 보통 반대 부호로 보낼 때가 많음
         float pitchRad = (float) Math.toRadians(-pitchDeg);
 
         yawRad = clamp(yawRad, NECK_MIN, NECK_MAX);
@@ -270,16 +295,14 @@ public class WebotsController {
         );
 
         sendAsyncDirect(url).thenAccept(success -> {
-            if (!success) {
-                LOGGER.debug("set_head failed");
+            if (success) {
+                headSent++;
+            } else {
+                errors++;
             }
         });
     }
 
-    /**
-     * 긴급 정지
-     *   /?command=stop_all
-     */
     private void sendStopAll() {
         String url = String.format("%s/?command=stop_all", serverUrl);
         sendAsyncDirect(url);
@@ -287,9 +310,6 @@ public class WebotsController {
 
     // ==================== HTTP 공통 ====================
 
-    /**
-     * 단순 비동기 GET 전송
-     */
     private CompletableFuture<Boolean> sendAsyncDirect(String url) {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
@@ -305,7 +325,7 @@ public class WebotsController {
                 })
                 .exceptionally(e -> {
                     connected = false;
-                    LOGGER.debug("Request failed: {}", e.toString());
+                    errors++;
                     return false;
                 });
     }
@@ -335,7 +355,7 @@ public class WebotsController {
     }
 
     public void shutdown() {
-        LOGGER.info("Shutting down WebotsController (RobotListener-only)...");
+        LOGGER.info("Shutting down WebotsController...");
         if (robotListenerEnabled) {
             sendStopAll();
         }
@@ -343,6 +363,6 @@ public class WebotsController {
     }
 
     private static float clamp(float v, float min, float max) {
-        return v < min ? min : (v > max ? max : v);
+        return v < min ? min : (Math.min(v, max));
     }
 }
