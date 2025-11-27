@@ -1,5 +1,6 @@
 package com.kAIS.KAIMyEntity.urdf.control;
 
+import com.kAIS.KAIMyEntity.coordinator.MotionCoordinator;
 import com.kAIS.KAIMyEntity.webots.WebotsConfigScreen;
 import com.kAIS.KAIMyEntity.webots.WebotsController;
 import net.minecraft.client.Minecraft;
@@ -20,6 +21,7 @@ public class VMCListenerController extends Screen {
     private static final int TEXT_COLOR = 0xFFFFFFFF;
     private static final int OK_COLOR = 0xFF55FF55;
     private static final int WARN_COLOR = 0xFFFF5555;
+    private static final int LOCK_COLOR = 0xFFFFAA00;  // 오렌지 - Lock 관련
     private static final Component TITLE = Component.literal("RobotListener Control");
 
     private final Screen parent;
@@ -28,7 +30,15 @@ public class VMCListenerController extends Screen {
     private EditBox portField;
     private Button connectButton;
     private Button toggleControlButton;
+    private Button forceReleaseButton;
     private Button closeButton;
+    
+    // 팔/머리 제어 버튼
+    private Button centerHeadButton;
+    private Button tPoseButton;
+    private Button guardPoseButton;
+    private Button waveButton;
+    private Button resetArmsButton;
 
     private WebotsController controller;
     private String statusMessage = "";
@@ -82,6 +92,50 @@ public class VMCListenerController extends Screen {
                 .bounds(centerX - panelWidth / 2, startY + 78, panelWidth, 20)
                 .build();
         addRenderableWidget(this.toggleControlButton);
+        
+        // Force Release 버튼 (Lock이 걸려있을 때만 활성화)
+        this.forceReleaseButton = Button.builder(Component.literal("Force Release Lock"),
+                        button -> handleForceRelease())
+                .bounds(centerX - panelWidth / 2, startY + 104, panelWidth, 20)
+                .build();
+        addRenderableWidget(this.forceReleaseButton);
+        
+        // ========== 팔/머리 제어 버튼 (아래쪽) ==========
+        int armButtonY = startY + 134;
+        int halfWidth = panelWidth / 2 - 2;
+        
+        // 첫 번째 줄: Center Head, Reset Arms
+        this.centerHeadButton = Button.builder(Component.literal("Center Head"),
+                        button -> handleCenterHead())
+                .bounds(centerX - panelWidth / 2, armButtonY, halfWidth, 18)
+                .build();
+        addRenderableWidget(this.centerHeadButton);
+        
+        this.resetArmsButton = Button.builder(Component.literal("Reset Arms"),
+                        button -> handleResetArms())
+                .bounds(centerX + 2, armButtonY, halfWidth, 18)
+                .build();
+        addRenderableWidget(this.resetArmsButton);
+        
+        // 두 번째 줄: T-Pose, Guard
+        this.tPoseButton = Button.builder(Component.literal("T-Pose"),
+                        button -> handleTPose())
+                .bounds(centerX - panelWidth / 2, armButtonY + 22, halfWidth, 18)
+                .build();
+        addRenderableWidget(this.tPoseButton);
+        
+        this.guardPoseButton = Button.builder(Component.literal("Guard"),
+                        button -> handleGuardPose())
+                .bounds(centerX + 2, armButtonY + 22, halfWidth, 18)
+                .build();
+        addRenderableWidget(this.guardPoseButton);
+        
+        // 세 번째 줄: Wave (가운데 정렬)
+        this.waveButton = Button.builder(Component.literal("Wave Hand"),
+                        button -> handleWave())
+                .bounds(centerX - panelWidth / 4, armButtonY + 44, panelWidth / 2, 18)
+                .build();
+        addRenderableWidget(this.waveButton);
 
         this.closeButton = Button.builder(Component.literal("Close"),
                         button -> onClose())
@@ -111,7 +165,7 @@ public class VMCListenerController extends Screen {
         graphics.fill(0, 0, this.width, this.height, BG_COLOR);
 
         int panelW = 300;
-        int panelH = 150;
+        int panelH = 260;  // 높이 증가 (Lock 상태 + 팔 제어 버튼)
         int panelX = this.width / 2 - panelW / 2;
         int panelY = this.height / 2 - panelH / 2;
         graphics.fill(panelX, panelY, panelX + panelW, panelY + panelH, PANEL_COLOR);
@@ -127,6 +181,7 @@ public class VMCListenerController extends Screen {
         if (controller != null) {
             int statusY = panelY + 90;
 
+            // 연결 상태
             boolean connected = controller.isConnected();
             String connection = connected
                     ? "● Connected to " + controller.getRobotAddress()
@@ -136,11 +191,52 @@ public class VMCListenerController extends Screen {
                     this.width / 2, statusY,
                     connected ? OK_COLOR : WARN_COLOR);
 
+            // Robot Control 상태
             String controlLabel = controller.isRobotListenerEnabled()
                     ? "Robot control: ENABLED (WASD + Mouse)"
                     : "Robot control: DISABLED";
             graphics.drawCenteredString(this.font, controlLabel,
                     this.width / 2, statusY + 12, TEXT_COLOR);
+            
+            // Lock 상태 표시
+            MotionCoordinator.LockStatus lockStatus = controller.getCoordinatorStatus();
+            String lockLabel;
+            int lockColor;
+            
+            if (lockStatus.locked) {
+                boolean isMe = controller.getOwnerId().equals(lockStatus.owner);
+                if (isMe) {
+                    lockLabel = String.format("⚠ Lock: ME (%s)", lockStatus.owner);
+                    lockColor = OK_COLOR;
+                } else {
+                    lockLabel = String.format("⚠ Lock: %s (task: %s, %ds ago)", 
+                                             lockStatus.owner, 
+                                             lockStatus.taskDescription,
+                                             lockStatus.elapsedMs / 1000);
+                    lockColor = LOCK_COLOR;
+                }
+            } else {
+                lockLabel = "● Lock: FREE";
+                lockColor = OK_COLOR;
+            }
+            graphics.drawCenteredString(this.font, lockLabel,
+                    this.width / 2, statusY + 24, lockColor);
+            
+            // hasLock 상태
+            String hasLockLabel = controller.hasLock() 
+                    ? "✓ Has Lock" 
+                    : "✗ No Lock";
+            graphics.drawCenteredString(this.font, hasLockLabel,
+                    this.width / 2, statusY + 36, 
+                    controller.hasLock() ? OK_COLOR : WARN_COLOR);
+            
+            // Blocked count
+            int blocked = controller.getLockBlockedCount();
+            if (blocked > 0) {
+                String blockedLabel = String.format("Blocked commands: %d", blocked);
+                graphics.drawCenteredString(this.font, blockedLabel,
+                        this.width / 2, statusY + 48, LOCK_COLOR);
+            }
 
         } else {
             graphics.drawCenteredString(this.font, "Controller not initialized",
@@ -197,25 +293,130 @@ public class VMCListenerController extends Screen {
         controller.enableRobotListener(enable);
 
         if (enable) {
-            setStatus("Robot control enabled. Use WASD + Mouse.", OK_COLOR);
+            if (controller.hasLock()) {
+                setStatus("Robot control enabled with Lock. Use WASD + Mouse.", OK_COLOR);
+            } else {
+                setStatus("Robot control enabled but NO LOCK. Commands blocked.", LOCK_COLOR);
+            }
         } else {
-            setStatus("Robot control disabled.", OK_COLOR);
+            setStatus("Robot control disabled. Lock released.", OK_COLOR);
         }
 
         updateToggleButtonText();
         updateButtonStates();
+    }
+    
+    private void handleForceRelease() {
+        MotionCoordinator coordinator = MotionCoordinator.getInstance();
+        coordinator.forceRelease("Manual force release from UI");
+        setStatus("Lock force released!", OK_COLOR);
+        
+        // Lock 재획득 시도
+        if (controller != null && controller.isRobotListenerEnabled()) {
+            controller.tryReacquireLock();
+            if (controller.hasLock()) {
+                setStatus("Lock force released and reacquired!", OK_COLOR);
+            }
+        }
+        
+        updateButtonStates();
+    }
+    
+    // ========== 팔/머리 제어 핸들러 ==========
+    
+    private void handleCenterHead() {
+        if (controller == null) {
+            setStatus("Controller not available", WARN_COLOR);
+            return;
+        }
+        if (!controller.isRobotListenerEnabled()) {
+            setStatus("Enable Robot Control first", WARN_COLOR);
+            return;
+        }
+        controller.centerHead();
+        setStatus("Head centered at current position", OK_COLOR);
+    }
+    
+    private void handleResetArms() {
+        if (controller == null) {
+            setStatus("Controller not available", WARN_COLOR);
+            return;
+        }
+        if (!controller.isRobotListenerEnabled()) {
+            setStatus("Enable Robot Control first", WARN_COLOR);
+            return;
+        }
+        controller.resetToStandPose();
+        setStatus("Arms reset to standing pose", OK_COLOR);
+    }
+    
+    private void handleTPose() {
+        if (controller == null) {
+            setStatus("Controller not available", WARN_COLOR);
+            return;
+        }
+        if (!controller.isRobotListenerEnabled()) {
+            setStatus("Enable Robot Control first", WARN_COLOR);
+            return;
+        }
+        controller.setTPose();
+        setStatus("T-Pose activated", OK_COLOR);
+    }
+    
+    private void handleGuardPose() {
+        if (controller == null) {
+            setStatus("Controller not available", WARN_COLOR);
+            return;
+        }
+        if (!controller.isRobotListenerEnabled()) {
+            setStatus("Enable Robot Control first", WARN_COLOR);
+            return;
+        }
+        controller.setGuardPose();
+        setStatus("Guard pose activated", OK_COLOR);
+    }
+    
+    private void handleWave() {
+        if (controller == null) {
+            setStatus("Controller not available", WARN_COLOR);
+            return;
+        }
+        if (!controller.isRobotListenerEnabled()) {
+            setStatus("Enable Robot Control first", WARN_COLOR);
+            return;
+        }
+        controller.waveHand();
+        setStatus("Waving hand!", OK_COLOR);
     }
 
     private void updateButtonStates() {
         if (toggleControlButton == null) return;
 
         boolean hasController = controller != null;
+        boolean robotEnabled = hasController && controller.isRobotListenerEnabled();
 
         toggleControlButton.active = hasController;
 
         if (connectButton != null) {
             connectButton.active = true;
         }
+        
+        // Force Release 버튼: Lock이 걸려있을 때만 활성화
+        if (forceReleaseButton != null) {
+            if (hasController) {
+                MotionCoordinator.LockStatus status = controller.getCoordinatorStatus();
+                forceReleaseButton.active = status.locked;
+            } else {
+                forceReleaseButton.active = false;
+            }
+        }
+        
+        // 팔/머리 제어 버튼: Robot Control이 활성화되어 있을 때만 활성화
+        if (centerHeadButton != null) centerHeadButton.active = robotEnabled;
+        if (resetArmsButton != null) resetArmsButton.active = robotEnabled;
+        if (tPoseButton != null) tPoseButton.active = robotEnabled;
+        if (guardPoseButton != null) guardPoseButton.active = robotEnabled;
+        if (waveButton != null) waveButton.active = robotEnabled;
     }
 
     private void updateToggleButtonText() {
