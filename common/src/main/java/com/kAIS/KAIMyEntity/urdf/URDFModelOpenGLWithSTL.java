@@ -15,10 +15,7 @@ import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
 import java.io.File;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 /**
  * URDF 모델 렌더링 (STL 메시 포함)
@@ -189,6 +186,64 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                 logger.warn("✗ Joint NOT FOUND: '{}' (mapped: '{}')", name, mappedName);
             }
         }
+    }
+
+    /**
+     * ✅ 이동 가능한 관절 이름 목록 반환
+     */
+    public List<String> getMovableJointNames() {
+        List<String> names = new ArrayList<>();
+        if (robotModel != null && robotModel.joints != null) {
+            for (URDFJoint joint : robotModel.joints) {
+                if (joint.isMovable()) {
+                    names.add(joint.name);
+                }
+            }
+        }
+        return names;
+    }
+
+    /**
+     * ✅ 관절 제한값 반환 [lower, upper]
+     */
+    public float[] getJointLimits(String jointName) {
+        if (robotModel != null && robotModel.joints != null) {
+            for (URDFJoint joint : robotModel.joints) {
+                if (joint.name.equals(jointName) && joint.limit != null) {
+                    return new float[]{joint.limit.lower, joint.limit.upper};
+                }
+            }
+        }
+        return new float[]{(float)-Math.PI, (float)Math.PI};
+    }
+
+    /**
+     * ✅ 현재 관절 위치 반환
+     */
+    public float getJointPosition(String jointName) {
+        if (robotModel != null && robotModel.joints != null) {
+            for (URDFJoint joint : robotModel.joints) {
+                if (joint.name.equals(jointName)) {
+                    return joint.currentPosition;
+                }
+            }
+        }
+        return 0f;
+    }
+
+    /**
+     * ✅ 모든 관절의 현재 위치를 Map으로 반환
+     */
+    public Map<String, Float> getAllJointPositions() {
+        Map<String, Float> positions = new HashMap<>();
+        if (robotModel != null && robotModel.joints != null) {
+            for (URDFJoint joint : robotModel.joints) {
+                if (joint.isMovable()) {
+                    positions.put(joint.name, joint.currentPosition);
+                }
+            }
+        }
+        return positions;
     }
 
     /**
