@@ -1,4 +1,4 @@
-# Minecraft Physical AI RL
+# Physical AI RL IN  Minecraft
 
 마인크래프트를 통해 피지컬 AI 강화학습을 쉽게 접하고 즐길 수 있는 프로젝트입니다.
 
