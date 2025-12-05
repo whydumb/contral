@@ -19,6 +19,7 @@ import java.util.*;
 
 /**
  * URDF 모델 렌더링 (STL 메시 포함)
+ * ✅ 좌표계 변환 및 위치 보정 수정
  */
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
@@ -29,28 +30,84 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
     private final Map<String, STLLoader.STLMesh> meshCache = new HashMap<>();
 
+    // ✅ 스케일 및 위치 설정
     private static final float GLOBAL_SCALE = 5.0f;
+    private static final float BASE_HEIGHT = 1.5f;  // 기본 높이 (블록 단위) - 약간 낮춤
+    private float groundOffset = 0.0f;  // 발-지면 자동 오프셋
+    
     private static final boolean FLIP_NORMALS = true;
+    private static final boolean DEBUG_MODE = false;  // 디버그 로그 활성화
 
-    private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1);
-    private static final Vector3f SRC_FWD = new Vector3f(1, 0, 0);
-    private static final boolean FORWARD_NEG_Z = true;
-    private static final Vector3f DST_UP  = new Vector3f(0, 1, 0);
-    private static final Vector3f DST_FWD = FORWARD_NEG_Z ? new Vector3f(0, 0, -1) : new Vector3f(0, 0, 1);
+    // ✅ ROS 좌표계: z-up, x-forward
+    // ✅ MC 좌표계: y-up, z-backward (플레이어 바라보는 방향이 -Z)
+    private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1);   // ROS z-up
+    private static final Vector3f SRC_FWD = new Vector3f(1, 0, 0);   // ROS x-forward
+    private static final Vector3f DST_UP  = new Vector3f(0, 1, 0);   // MC y-up
+    private static final Vector3f DST_FWD = new Vector3f(0, 0, -1);  // MC -z forward
     private static final Quaternionf Q_ROS2MC = makeUprightQuat(SRC_UP, SRC_FWD, DST_UP, DST_FWD);
 
     // ✅ 관절 이름 매핑 (VMD 이름 → URDF 이름)
     private final Map<String, String> jointNameMapping = new HashMap<>();
     
-    // ✅ 디버그용 플래그
     private boolean jointMappingInitialized = false;
 
     public URDFModelOpenGLWithSTL(URDFModel robotModel, String modelDir) {
         this.robotModel = robotModel;
         this.modelDir = modelDir;
-        logger.info("=== URDF renderer Created ===");
+        logger.info("=== URDF renderer Created (Scale: {}) ===", GLOBAL_SCALE);
         loadAllMeshes();
         initJointNameMapping();
+        calculateGroundOffset();  // ✅ 발-지면 오프셋 자동 계산
+    }
+
+    /**
+     * ✅ 발-지면 오프셋 자동 계산
+     * URDF의 base_link가 몸통 기준일 때 발이 지면에 닿도록 보정
+     */
+    private void calculateGroundOffset() {
+        float minZ = 0.0f;
+        boolean foundFootLink = false;
+        
+        // 발/발목 관련 링크의 최소 Z값 찾기 (ROS 좌표계 기준)
+        for (URDFLink link : robotModel.links) {
+            String lowerName = link.name.toLowerCase();
+            if (lowerName.contains("foot") || lowerName.contains("ankle") || 
+                lowerName.contains("toe") || lowerName.contains("sole")) {
+                
+                foundFootLink = true;
+                
+                if (link.visual != null && link.visual.origin != null) {
+                    minZ = Math.min(minZ, link.visual.origin.xyz.z);
+                }
+                
+                // 메시가 있으면 메시의 바운딩 박스도 체크
+                STLLoader.STLMesh mesh = meshCache.get(link.name);
+                if (mesh != null) {
+                    for (STLLoader.Triangle tri : mesh.triangles) {
+                        for (Vector3f v : tri.vertices) {
+                            minZ = Math.min(minZ, v.z);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 발 링크를 못 찾았으면 전체 모델의 최소값 사용
+        if (!foundFootLink) {
+            logger.warn("No foot/ankle links found, calculating from all meshes");
+            for (STLLoader.STLMesh mesh : meshCache.values()) {
+                for (STLLoader.Triangle tri : mesh.triangles) {
+                    for (Vector3f v : tri.vertices) {
+                        minZ = Math.min(minZ, v.z);
+                    }
+                }
+            }
+        }
+        
+        // 스케일 적용한 오프셋 (음수면 위로 올림)
+        groundOffset = -minZ * GLOBAL_SCALE;
+        logger.info("✓ Ground offset calculated: {:.3f} blocks (raw Z: {:.3f}m, found feet: {})", 
+                    groundOffset, minZ, foundFootLink);
     }
 
     /**
@@ -103,7 +160,6 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             }
         }
         
-        // 매핑 안 된 VMD 이름은 그대로 사용 (직접 매칭 시도)
         jointMappingInitialized = true;
         logger.info("=== Joint Mapping Complete: {} mappings ===", jointNameMapping.size());
     }
@@ -176,13 +232,13 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         if (j != null) {
             j.currentPosition = value;
             // 디버그 (처음 몇 번만)
-            if (renderCount < 5) {
+            if (DEBUG_MODE && renderCount < 5) {
                 logger.info("✓ Joint '{}' -> '{}' = {} rad ({} deg)", 
                     name, j.name, value, Math.toDegrees(value));
             }
         } else {
             // 못 찾은 경우 경고 (처음 몇 번만)
-            if (renderCount < 5) {
+            if (DEBUG_MODE && renderCount < 5) {
                 logger.warn("✗ Joint NOT FOUND: '{}' (mapped: '{}')", name, mappedName);
             }
         }
@@ -278,7 +334,8 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
         renderCount++;
         if (renderCount % 120 == 1) {
-            logger.info("=== URDF RENDER #{} ===", renderCount);
+            logger.info("=== URDF RENDER #{} (Scale: {}, Offset: {}) ===", 
+                       renderCount, GLOBAL_SCALE, groundOffset);
         }
 
         RenderSystem.enableBlend();
@@ -291,8 +348,20 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
         if (robotModel.rootLinkName != null) {
             poseStack.pushPose();
-            poseStack.scale(GLOBAL_SCALE, GLOBAL_SCALE, GLOBAL_SCALE);
+
+            // ✅ 수정된 변환 순서: translate → rotate → scale
+            // 이렇게 하면 Y 이동이 MC 월드 좌표계 기준으로 적용됨
+            
+            // 1. Y 오프셋 (MC 월드 좌표계에서 먼저 이동)
+            float totalYOffset = BASE_HEIGHT + groundOffset;
+            poseStack.translate(0.0f, totalYOffset, 0.0f);
+            
+            // 2. 좌표계 변환 (ROS → MC)
             poseStack.mulPose(new Quaternionf(Q_ROS2MC));
+            
+            // 3. 스케일 적용 (변환된 좌표계에서)
+            poseStack.scale(GLOBAL_SCALE, GLOBAL_SCALE, GLOBAL_SCALE);
+
             renderLinkRecursive(robotModel.rootLinkName, poseStack, vc, packedLight);
             poseStack.popPose();
         }
