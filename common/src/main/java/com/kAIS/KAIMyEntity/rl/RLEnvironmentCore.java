@@ -1,23 +1,20 @@
-package com.kAIS.KAIMyEntity.rl;
+Copypackage com.kAIS.KAIMyEntity.rl;
 
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.kAIS.KAIMyEntity.urdf.URDFRobotModel;
-import net.minecraft.world.phys.Vec3;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.nio.ByteBuffer;
-import java.nio.FloatBuffer;
 import java.util.*;
+import java.util.function.Consumer;
 
 /**
- * MuJoCo 스타일 RL 환경 핵심 구현
+ * MuJoCo 스타일 RL 환경 - 모드 내부 완결형
  * 
- * 통합 클래스:
- * - 관측 상태 (Observation)
- * - 행동 적용 (Action)
- * - 보상 계산 (Reward)
- * - 환경 설정 (Config)
+ * 기능:
+ * - 환경 (Observation, Action, Reward)
+ * - 내장 에이전트 (Random, Simple Policy, Imitation)
+ * - 학습 루프 (틱 기반)
  */
 public class RLEnvironmentCore {
     private static final Logger logger = LogManager.getLogger();
@@ -44,15 +41,28 @@ public class RLEnvironmentCore {
     private final List<JointState> jointStates = new ArrayList<>();
     private final Map<String, Integer> jointIndexMap = new HashMap<>();
     
+    // 에피소드 상태
     private int stepCount = 0;
+    private int episodeCount = 0;
     private float episodeReward = 0f;
     private float lastReward = 0f;
     private boolean isDone = false;
     private boolean isInitialized = false;
     
+    // 학습 상태
+    private boolean trainingActive = false;
+    private AgentMode agentMode = AgentMode.MANUAL;
+    private final SimpleAgent agent = new SimpleAgent();
+    
     // 이전 상태 (보상 계산용)
     private float[] prevRootPosition = new float[3];
-    private float[] prevJointPositions;
+    private float prevRootHeight = 1.0f;
+    
+    // 통계
+    private final Statistics stats = new Statistics();
+    
+    // 콜백
+    private Consumer<String> logCallback;
     
     // ========== 초기화 ==========
     
@@ -68,7 +78,7 @@ public class RLEnvironmentCore {
         this.robot = renderer.getRobotModel();
         
         if (robot == null || robot.joints == null) {
-            logger.warn("No robot model available");
+            log("WARN: No robot model available");
             isInitialized = false;
             return;
         }
@@ -91,228 +101,222 @@ public class RLEnvironmentCore {
                 js.minLimit = lower;
                 js.maxLimit = upper;
                 js.targetPosition = joint.currentPosition;
+                js.initialPosition = joint.currentPosition;
                 
                 jointStates.add(js);
                 jointIndexMap.put(joint.name, idx++);
             }
         }
         
-        prevJointPositions = new float[jointStates.size()];
+        // 에이전트 초기화
+        agent.initialize(jointStates.size());
         
         isInitialized = true;
-        logger.info("RLEnvironmentCore initialized with {} joints, obs={}, act={}",
-            jointStates.size(), getObservationDim(), getActionDim());
+        log("Initialized: " + jointStates.size() + " joints, obs=" + getObservationDim() + ", act=" + getActionDim());
     }
     
-    // ========== 환경 인터페이스 (Gym 스타일) ==========
+    // ========== 메인 틱 (GUI에서 호출) ==========
+    
+    /**
+     * 매 틱마다 호출 - 학습/추론 루프
+     */
+    public void tick(float deltaTime) {
+        if (!isInitialized || !trainingActive) return;
+        
+        // 1. 관측 수집
+        float[] observation = getObservation();
+        
+        // 2. 에이전트에서 행동 얻기
+        float[] action = agent.selectAction(observation, agentMode);
+        
+        // 3. 행동 적용
+        applyAction(action);
+        
+        // 4. 물리 시뮬레이션 (간단 버전)
+        simulatePhysics(deltaTime);
+        
+        // 5. 새 관측
+        float[] newObservation = getObservation();
+        
+        // 6. 보상 계산
+        float reward = calculateReward(action);
+        lastReward = reward;
+        episodeReward += reward;
+        
+        // 7. 종료 조건
+        stepCount++;
+        boolean terminated = checkTermination();
+        boolean truncated = stepCount >= config.maxEpisodeSteps;
+        isDone = terminated || truncated;
+        
+        // 8. 에이전트 학습 (경험 저장)
+        if (agentMode == AgentMode.LEARNING) {
+            agent.storeExperience(observation, action, reward, newObservation, isDone);
+            
+            // 배치 학습 (일정 스텝마다)
+            if (stepCount % config.updateInterval == 0) {
+                agent.update();
+            }
+        }
+        
+        // 9. 에피소드 종료 처리
+        if (isDone) {
+            endEpisode(terminated ? "terminated" : "truncated");
+        }
+        
+        // 10. 이전 상태 업데이트
+        prevRootPosition = getRootPosition();
+        prevRootHeight = prevRootPosition[1];
+    }
+    
+    // ========== 환경 인터페이스 ==========
     
     /**
      * 환경 리셋
-     * @return 초기 관측값 (flat array)
      */
     public float[] reset() {
-        if (!isInitialized) {
-            logger.warn("Environment not initialized");
-            return new float[0];
-        }
+        if (!isInitialized) return new float[0];
         
         stepCount = 0;
         episodeReward = 0f;
         lastReward = 0f;
         isDone = false;
         
-        // 관절 초기화 (노이즈 추가 옵션)
+        // 관절 초기화
         Random rand = config.randomizeInitial ? new Random() : null;
         
-        for (int i = 0; i < jointStates.size(); i++) {
-            JointState js = jointStates.get(i);
-            float initPos = (js.minLimit + js.maxLimit) / 2f; // 중앙값
+        for (JointState js : jointStates) {
+            float initPos = js.initialPosition;
             
             if (rand != null) {
                 float range = (js.maxLimit - js.minLimit) * config.initNoiseScale;
                 initPos += (rand.nextFloat() - 0.5f) * range;
+                initPos = clamp(initPos, js.minLimit, js.maxLimit);
             }
             
             js.position = initPos;
             js.velocity = 0f;
             js.torque = 0f;
             js.targetPosition = initPos;
-            prevJointPositions[i] = initPos;
             
-            // 실제 모델에 적용
+            // 렌더러에 적용
             if (renderer != null) {
                 renderer.setJointTarget(js.name, initPos);
             }
         }
         
-        // 루트 위치 저장
         prevRootPosition = getRootPosition();
+        prevRootHeight = prevRootPosition[1];
         
-        logger.debug("Environment reset, step=0");
         return getObservation();
-    }
-    
-    /**
-     * 환경 스텝 실행
-     * @param action 정규화된 행동 [-1, 1] 범위
-     * @return StepResult (obs, reward, done, truncated, info)
-     */
-    public StepResult step(float[] action) {
-        StepResult result = new StepResult();
-        
-        if (!isInitialized || action == null) {
-            result.observation = new float[0];
-            result.reward = 0;
-            result.done = true;
-            result.truncated = false;
-            return result;
-        }
-        
-        // 1. 행동 적용
-        applyAction(action);
-        
-        // 2. 물리 시뮬레이션 (frameSkip 반복)
-        for (int i = 0; i < config.frameSkip; i++) {
-            simulateStep();
-        }
-        
-        // 3. 상태 업데이트
-        updateJointStates();
-        
-        // 4. 관측 수집
-        result.observation = getObservation();
-        
-        // 5. 보상 계산
-        result.reward = calculateReward(action);
-        lastReward = result.reward;
-        episodeReward += result.reward;
-        
-        // 6. 종료 조건 확인
-        stepCount++;
-        result.done = checkTermination();
-        result.truncated = stepCount >= config.maxEpisodeSteps;
-        isDone = result.done || result.truncated;
-        
-        // 7. 정보 저장
-        result.info.put("step", stepCount);
-        result.info.put("episode_reward", episodeReward);
-        result.info.put("is_healthy", isHealthy());
-        
-        // 이전 상태 업데이트
-        for (int i = 0; i < jointStates.size(); i++) {
-            prevJointPositions[i] = jointStates.get(i).position;
-        }
-        prevRootPosition = getRootPosition();
-        
-        return result;
     }
     
     /**
      * 행동 적용
      */
     private void applyAction(float[] action) {
+        if (action == null) return;
+        
         int numActions = Math.min(action.length, jointStates.size());
         
         for (int i = 0; i < numActions; i++) {
             JointState js = jointStates.get(i);
-            float a = Math.max(-1f, Math.min(1f, action[i])); // 클램프
+            float a = clamp(action[i], -1f, 1f);
             
             switch (config.actionMode) {
                 case TORQUE:
-                    // 토크 직접 적용
                     js.torque = a * config.maxTorque;
                     break;
                     
                 case POSITION:
-                    // 목표 위치 (관절 범위 내)
-                    float range = js.maxLimit - js.minLimit;
-                    js.targetPosition = js.minLimit + (a + 1f) / 2f * range;
+                    // [-1,1] -> [min, max]
+                    js.targetPosition = js.minLimit + (a + 1f) / 2f * (js.maxLimit - js.minLimit);
                     break;
                     
                 case VELOCITY:
-                    // 목표 속도
                     js.targetVelocity = a * config.maxVelocity;
+                    break;
+                    
+                case DELTA_POSITION:
+                    // 현재 위치에서 델타 적용
+                    float delta = a * config.maxDeltaPosition;
+                    js.targetPosition = clamp(js.position + delta, js.minLimit, js.maxLimit);
                     break;
             }
             
             // 렌더러에 적용
-            if (renderer != null) {
-                if (config.actionMode == ActionMode.POSITION) {
-                    renderer.setJointTarget(js.name, js.targetPosition);
-                }
+            if (renderer != null && config.actionMode != ActionMode.TORQUE) {
+                renderer.setJointTarget(js.name, js.targetPosition);
             }
         }
     }
     
     /**
-     * 단일 물리 스텝 시뮬레이션
+     * 간단한 물리 시뮬레이션
      */
-    private void simulateStep() {
-        // PD 제어 적용 (Position 모드)
-        if (config.actionMode == ActionMode.POSITION) {
-            for (JointState js : jointStates) {
+    private void simulatePhysics(float dt) {
+        for (JointState js : jointStates) {
+            // PD 제어 (Position 모드)
+            if (config.actionMode == ActionMode.POSITION || 
+                config.actionMode == ActionMode.DELTA_POSITION) {
                 float error = js.targetPosition - js.position;
                 float deriv = -js.velocity;
                 js.torque = config.kp * error + config.kd * deriv;
-                js.torque = Math.max(-config.maxTorque, Math.min(config.maxTorque, js.torque));
+                js.torque = clamp(js.torque, -config.maxTorque, config.maxTorque);
+            }
+            
+            // 속도 제어 모드
+            if (config.actionMode == ActionMode.VELOCITY) {
+                float velError = js.targetVelocity - js.velocity;
+                js.torque = config.kp * velError;
+                js.torque = clamp(js.torque, -config.maxTorque, config.maxTorque);
+            }
+            
+            // 적분
+            float acceleration = js.torque; // 단순화: I=1
+            js.velocity += acceleration * dt;
+            js.velocity *= config.damping;
+            js.position += js.velocity * dt;
+            
+            // 관절 제한
+            if (js.position < js.minLimit) {
+                js.position = js.minLimit;
+                js.velocity = Math.max(0, js.velocity);
+            } else if (js.position > js.maxLimit) {
+                js.position = js.maxLimit;
+                js.velocity = Math.min(0, js.velocity);
             }
         }
         
-        // 간단한 물리 적분 (실제로는 ODE4J 사용)
-        float dt = config.timeStep;
-        for (JointState js : jointStates) {
-            // 가속도 (단순화: torque = I * alpha, I=1 가정)
-            float acceleration = js.torque;
-            
-            // 속도 업데이트
-            js.velocity += acceleration * dt;
-            js.velocity *= config.damping; // 감쇠
-            
-            // 위치 업데이트
-            js.position += js.velocity * dt;
-            
-            // 관절 제한 적용
-            if (js.position < js.minLimit) {
-                js.position = js.minLimit;
-                js.velocity = 0;
-            } else if (js.position > js.maxLimit) {
-                js.position = js.maxLimit;
-                js.velocity = 0;
-            }
-        }
+        // 실제 모델 상태 동기화
+        syncWithRenderer();
     }
     
     /**
-     * 관절 상태를 실제 모델에서 업데이트
+     * 렌더러와 상태 동기화
      */
-    private void updateJointStates() {
+    private void syncWithRenderer() {
         if (robot == null || robot.joints == null) return;
         
         for (var joint : robot.joints) {
             Integer idx = jointIndexMap.get(joint.name);
             if (idx != null) {
                 JointState js = jointStates.get(idx);
-                
-                // 이전 위치로 속도 추정
-                float prevPos = js.position;
-                js.position = joint.currentPosition;
-                js.velocity = (js.position - prevPos) / config.timeStep;
+                // 양방향 동기화
+                joint.currentPosition = js.position;
             }
         }
     }
     
     // ========== 관측 (Observation) ==========
     
-    /**
-     * 현재 관측값 반환
-     */
     public float[] getObservation() {
         List<Float> obs = new ArrayList<>();
         
-        // 1. 관절 위치 (정규화)
+        // 1. 관절 위치 (정규화 [-1, 1])
         for (JointState js : jointStates) {
-            float normalized = normalizeJointPosition(js);
-            obs.add(normalized);
+            float norm = 2f * (js.position - js.minLimit) / (js.maxLimit - js.minLimit) - 1f;
+            obs.add(clamp(norm, -1f, 1f));
         }
         
         // 2. 관절 속도 (스케일링)
@@ -322,27 +326,18 @@ public class RLEnvironmentCore {
             }
         }
         
-        // 3. 루트 바디 상태
+        // 3. 루트 바디 높이 (정규화)
         float[] rootPos = getRootPosition();
-        obs.add(rootPos[0]); // x (이동 방향)
-        obs.add(rootPos[1]); // y (높이)
-        obs.add(rootPos[2]); // z
+        obs.add((rootPos[1] - config.minHeight) / (config.maxHeight - config.minHeight));
         
+        // 4. 루트 속도 (수평)
         float[] rootVel = getRootVelocity();
-        obs.add(rootVel[0]);
-        obs.add(rootVel[1]);
-        obs.add(rootVel[2]);
+        obs.add(rootVel[0] / config.targetSpeed); // x
+        obs.add(rootVel[2] / config.targetSpeed); // z
         
-        // 4. 루트 방향 (sin, cos로 표현)
-        float[] rootOri = getRootOrientation();
-        obs.add((float)Math.sin(rootOri[1])); // yaw sin
-        obs.add((float)Math.cos(rootOri[1])); // yaw cos
-        
-        // 5. 목표 정보 (선택)
-        if (config.targetSpeed > 0) {
-            obs.add(config.targetSpeed);
-            obs.add(getCurrentSpeed());
-        }
+        // 5. 목표 속도와의 차이
+        float currentSpeed = (float)Math.sqrt(rootVel[0]*rootVel[0] + rootVel[2]*rootVel[2]);
+        obs.add((config.targetSpeed - currentSpeed) / config.targetSpeed);
         
         // float[] 변환
         float[] result = new float[obs.size()];
@@ -352,118 +347,207 @@ public class RLEnvironmentCore {
         return result;
     }
     
-    private float normalizeJointPosition(JointState js) {
-        float range = js.maxLimit - js.minLimit;
-        if (range <= 0) return 0;
-        return 2f * (js.position - js.minLimit) / range - 1f; // [-1, 1]
-    }
-    
     private float[] getRootPosition() {
-        // TODO: 실제 루트 바디 위치 가져오기
-        return new float[]{0f, 1.0f, 0f};
+        // TODO: 실제 루트 위치 연동
+        // 현재는 관절 평균 높이로 추정
+        float avgHeight = 1.0f;
+        if (!jointStates.isEmpty()) {
+            float sum = 0;
+            for (JointState js : jointStates) {
+                sum += (js.position - js.minLimit) / (js.maxLimit - js.minLimit);
+            }
+            avgHeight = 0.5f + sum / jointStates.size() * 0.5f;
+        }
+        return new float[]{0, avgHeight, 0};
     }
     
     private float[] getRootVelocity() {
         float[] current = getRootPosition();
+        float dt = config.timeStep;
         return new float[]{
-            (current[0] - prevRootPosition[0]) / config.timeStep,
-            (current[1] - prevRootPosition[1]) / config.timeStep,
-            (current[2] - prevRootPosition[2]) / config.timeStep
+            (current[0] - prevRootPosition[0]) / dt,
+            (current[1] - prevRootPosition[1]) / dt,
+            (current[2] - prevRootPosition[2]) / dt
         };
     }
     
-    private float[] getRootOrientation() {
-        // TODO: 실제 루트 방향 가져오기 (roll, pitch, yaw)
-        return new float[]{0f, 0f, 0f};
-    }
+    // ========== 보상 (Reward) ==========
     
-    private float getCurrentSpeed() {
-        float[] vel = getRootVelocity();
-        return (float)Math.sqrt(vel[0]*vel[0] + vel[2]*vel[2]);
-    }
-    
-    // ========== 보상 계산 (Reward) ==========
-    
-    /**
-     * MuJoCo 스타일 보상 계산
-     */
     private float calculateReward(float[] action) {
         float reward = 0f;
         
         // 1. 살아있음 보상
         reward += config.aliveBonus;
         
-        // 2. 전진 보상
+        // 2. 높이 유지 보상
         float[] rootPos = getRootPosition();
-        float forwardProgress = rootPos[0] - prevRootPosition[0];
-        reward += forwardProgress * config.forwardWeight;
+        float heightReward = 1f - Math.abs(rootPos[1] - config.targetHeight) / config.targetHeight;
+        reward += heightReward * config.heightRewardWeight;
         
-        // 3. 속도 매칭 보상
-        if (config.targetSpeed > 0) {
-            float speedError = Math.abs(getCurrentSpeed() - config.targetSpeed);
-            reward -= speedError * config.speedMatchWeight;
-        }
+        // 3. 속도 매칭 보상 (목표 속도 추종)
+        float[] rootVel = getRootVelocity();
+        float currentSpeed = (float)Math.sqrt(rootVel[0]*rootVel[0] + rootVel[2]*rootVel[2]);
+        float speedError = Math.abs(currentSpeed - config.targetSpeed);
+        reward -= speedError * config.speedMatchWeight;
         
-        // 4. 제어 비용 (토크 사용량)
+        // 4. 제어 비용 (부드러운 동작)
         float controlCost = 0f;
-        for (float a : action) {
-            controlCost += a * a;
+        if (action != null) {
+            for (float a : action) {
+                controlCost += a * a;
+            }
         }
         reward -= controlCost * config.controlCostWeight;
         
-        // 5. 건강 보상
-        if (isHealthy()) {
-            reward += config.healthyReward;
-        }
-        
-        // 6. 관절 속도 페널티 (부드러운 동작)
+        // 5. 관절 속도 페널티 (급격한 움직임 방지)
         float velocityPenalty = 0f;
         for (JointState js : jointStates) {
             velocityPenalty += js.velocity * js.velocity;
         }
         reward -= velocityPenalty * config.velocityPenaltyWeight;
         
+        // 6. 관절 제한 페널티
+        float limitPenalty = 0f;
+        for (JointState js : jointStates) {
+            float margin = 0.1f * (js.maxLimit - js.minLimit);
+            if (js.position < js.minLimit + margin || js.position > js.maxLimit - margin) {
+                limitPenalty += 0.1f;
+            }
+        }
+        reward -= limitPenalty;
+        
+        // 7. 대칭 보상 (양쪽 관절 유사하게)
+        reward += calculateSymmetryReward() * config.symmetryRewardWeight;
+        
         return reward;
+    }
+    
+    private float calculateSymmetryReward() {
+        // 간단한 대칭 보상: 이름에 L/R이 있는 관절 쌍 비교
+        float symmetry = 0f;
+        int pairs = 0;
+        
+        for (JointState js : jointStates) {
+            if (js.name.contains("_L_") || js.name.contains("Left")) {
+                String rightName = js.name.replace("_L_", "_R_").replace("Left", "Right");
+                Integer rightIdx = jointIndexMap.get(rightName);
+                if (rightIdx != null) {
+                    JointState rightJs = jointStates.get(rightIdx);
+                    float diff = Math.abs(js.position - rightJs.position);
+                    symmetry += 1f - diff / Math.PI;
+                    pairs++;
+                }
+            }
+        }
+        
+        return pairs > 0 ? symmetry / pairs : 0f;
     }
     
     // ========== 종료 조건 ==========
     
-    /**
-     * 에피소드 종료 확인
-     */
     private boolean checkTermination() {
         if (!config.terminateOnFall) return false;
-        return !isHealthy();
-    }
-    
-    /**
-     * 건강 상태 확인 (쓰러짐 감지)
-     */
-    public boolean isHealthy() {
+        
         float[] rootPos = getRootPosition();
         
         // 높이 체크
-        if (rootPos[1] < config.minHeight || rootPos[1] > config.maxHeight) {
-            return false;
+        if (rootPos[1] < config.minHeight) {
+            log("Terminated: height too low (" + String.format("%.2f", rootPos[1]) + ")");
+            return true;
         }
         
-        // 기울기 체크
-        float[] ori = getRootOrientation();
-        if (Math.abs(ori[0]) > config.maxTilt || Math.abs(ori[2]) > config.maxTilt) {
-            return false;
-        }
-        
-        return true;
+        return false;
     }
     
-    // ========== 공간 정보 ==========
+    public boolean isHealthy() {
+        float[] rootPos = getRootPosition();
+        return rootPos[1] >= config.minHeight && rootPos[1] <= config.maxHeight;
+    }
+    
+    // ========== 에피소드 관리 ==========
+    
+    private void endEpisode(String reason) {
+        episodeCount++;
+        stats.recordEpisode(episodeReward, stepCount);
+        
+        log(String.format("Episode %d ended (%s): reward=%.2f, steps=%d", 
+            episodeCount, reason, episodeReward, stepCount));
+        
+        // 자동 리셋
+        if (trainingActive) {
+            reset();
+        }
+    }
+    
+    // ========== 학습 제어 ==========
+    
+    public void startTraining(AgentMode mode) {
+        if (!isInitialized) {
+            log("ERROR: Cannot start - not initialized");
+            return;
+        }
+        
+        agentMode = mode;
+        trainingActive = true;
+        reset();
+        
+        log("Training started: mode=" + mode);
+    }
+    
+    public void stopTraining() {
+        trainingActive = false;
+        log("Training stopped");
+    }
+    
+    public void setAgentMode(AgentMode mode) {
+        this.agentMode = mode;
+        log("Agent mode: " + mode);
+    }
+    
+    // ========== 수동 제어 ==========
+    
+    /**
+     * 외부에서 관절 직접 제어 (GUI 슬라이더 등)
+     */
+    public void setJointPosition(String name, float position) {
+        Integer idx = jointIndexMap.get(name);
+        if (idx == null) return;
+        
+        JointState js = jointStates.get(idx);
+        js.position = clamp(position, js.minLimit, js.maxLimit);
+        js.targetPosition = js.position;
+        js.velocity = 0;
+        
+        if (renderer != null) {
+            renderer.setJointTarget(name, js.position);
+        }
+    }
+    
+    /**
+     * 수동 스텝 (GUI Step 버튼)
+     */
+    public void manualStep() {
+        if (!isInitialized) return;
+        
+        // 랜덤 행동으로 한 스텝
+        float[] action = agent.selectAction(getObservation(), AgentMode.RANDOM);
+        applyAction(action);
+        simulatePhysics(config.timeStep);
+        
+        float reward = calculateReward(action);
+        lastReward = reward;
+        episodeReward += reward;
+        stepCount++;
+        
+        log(String.format("Manual step %d: reward=%.4f", stepCount, reward));
+    }
+    
+    // ========== 정보 조회 ==========
     
     public int getObservationDim() {
         int dim = jointStates.size(); // 위치
         if (config.includeVelocities) dim += jointStates.size(); // 속도
-        dim += 6; // 루트 위치 + 속도
-        dim += 2; // 루트 방향 (sin, cos)
-        if (config.targetSpeed > 0) dim += 2; // 목표/현재 속도
+        dim += 4; // 높이 + 속도xy + 속도차
         return dim;
     }
     
@@ -471,9 +555,17 @@ public class RLEnvironmentCore {
         return jointStates.size();
     }
     
-    public int getJointCount() {
-        return jointStates.size();
-    }
+    public int getJointCount() { return jointStates.size(); }
+    public boolean isInitialized() { return isInitialized; }
+    public boolean isTraining() { return trainingActive; }
+    public boolean isDone() { return isDone; }
+    public int getStepCount() { return stepCount; }
+    public int getEpisodeCount() { return episodeCount; }
+    public float getEpisodeReward() { return episodeReward; }
+    public float getLastReward() { return lastReward; }
+    public AgentMode getAgentMode() { return agentMode; }
+    public Config getConfig() { return config; }
+    public Statistics getStats() { return stats; }
     
     public List<String> getJointNames() {
         List<String> names = new ArrayList<>();
@@ -483,41 +575,14 @@ public class RLEnvironmentCore {
         return names;
     }
     
-    // ========== 상태 조회 ==========
-    
-    public boolean isInitialized() { return isInitialized; }
-    public boolean isDone() { return isDone; }
-    public int getStepCount() { return stepCount; }
-    public float getEpisodeReward() { return episodeReward; }
-    public float getLastReward() { return lastReward; }
-    public Config getConfig() { return config; }
-    
-    /**
-     * 특정 관절 위치 가져오기
-     */
     public float getJointPosition(String name) {
         Integer idx = jointIndexMap.get(name);
-        if (idx == null) return 0;
-        return jointStates.get(idx).position;
+        return idx != null ? jointStates.get(idx).position : 0;
     }
     
-    /**
-     * 특정 관절 속도 가져오기
-     */
     public float getJointVelocity(String name) {
         Integer idx = jointIndexMap.get(name);
-        if (idx == null) return 0;
-        return jointStates.get(idx).velocity;
-    }
-    
-    /**
-     * 외부에서 관절 위치 설정 (GUI 등)
-     */
-    public void setJointPosition(String name, float position) {
-        Integer idx = jointIndexMap.get(name);
-        if (idx == null) return;
-        jointStates.get(idx).position = position;
-        jointStates.get(idx).targetPosition = position;
+        return idx != null ? jointStates.get(idx).velocity : 0;
     }
     
     /**
@@ -526,15 +591,33 @@ public class RLEnvironmentCore {
     public Map<String, Object> getDebugInfo() {
         Map<String, Object> info = new LinkedHashMap<>();
         info.put("initialized", isInitialized);
+        info.put("training", trainingActive);
+        info.put("mode", agentMode.name());
+        info.put("episode", episodeCount);
         info.put("step", stepCount);
-        info.put("episodeReward", String.format("%.3f", episodeReward));
-        info.put("lastReward", String.format("%.4f", lastReward));
+        info.put("reward", String.format("%.3f", episodeReward));
+        info.put("lastR", String.format("%.4f", lastReward));
         info.put("healthy", isHealthy());
         info.put("joints", jointStates.size());
-        info.put("obsDim", getObservationDim());
-        info.put("actDim", getActionDim());
-        info.put("actionMode", config.actionMode.name());
+        info.put("avgReward", String.format("%.2f", stats.getAverageReward()));
         return info;
+    }
+    
+    // ========== 유틸리티 ==========
+    
+    private float clamp(float v, float min, float max) {
+        return Math.max(min, Math.min(max, v));
+    }
+    
+    public void setLogCallback(Consumer<String> callback) {
+        this.logCallback = callback;
+    }
+    
+    private void log(String msg) {
+        logger.info(msg);
+        if (logCallback != null) {
+            logCallback.accept(msg);
+        }
     }
     
     // ========== 내부 클래스 ==========
@@ -551,43 +634,28 @@ public class RLEnvironmentCore {
         float maxLimit;
         float targetPosition;
         float targetVelocity;
-    }
-    
-    /**
-     * 스텝 결과
-     */
-    public static class StepResult {
-        public float[] observation;
-        public float reward;
-        public boolean done;
-        public boolean truncated;
-        public Map<String, Object> info = new HashMap<>();
-        
-        /**
-         * 바이트 배열로 직렬화 (Python 통신용)
-         */
-        public byte[] toBytes() {
-            int obsLen = observation != null ? observation.length : 0;
-            ByteBuffer buffer = ByteBuffer.allocate(obsLen * 4 + 4 + 1 + 1);
-            
-            for (int i = 0; i < obsLen; i++) {
-                buffer.putFloat(observation[i]);
-            }
-            buffer.putFloat(reward);
-            buffer.put((byte)(done ? 1 : 0));
-            buffer.put((byte)(truncated ? 1 : 0));
-            
-            return buffer.array();
-        }
+        float initialPosition;
     }
     
     /**
      * 행동 모드
      */
     public enum ActionMode {
-        TORQUE,     // 직접 토크 제어
-        POSITION,   // 목표 위치 (PD 제어)
-        VELOCITY    // 목표 속도
+        TORQUE,         // 직접 토크
+        POSITION,       // 목표 위치 (절대)
+        DELTA_POSITION, // 델타 위치 (상대)
+        VELOCITY        // 목표 속도
+    }
+    
+    /**
+     * 에이전트 모드
+     */
+    public enum AgentMode {
+        MANUAL,     // 수동 제어 (GUI)
+        RANDOM,     // 랜덤 행동
+        LEARNING,   // 학습 중
+        INFERENCE,  // 학습된 정책 실행
+        IMITATION   // 모방 학습 (VMD 추종)
     }
     
     /**
@@ -595,65 +663,282 @@ public class RLEnvironmentCore {
      */
     public static class Config {
         // 시뮬레이션
-        public float timeStep = 0.02f;          // 20ms
-        public int frameSkip = 4;               // 행동 반복
-        public int maxEpisodeSteps = 1000;
+        public float timeStep = 0.02f;
+        public int maxEpisodeSteps = 500;
+        public int updateInterval = 64;  // 학습 업데이트 간격
         
         // 관측
         public boolean includeVelocities = true;
         
         // 행동
         public ActionMode actionMode = ActionMode.POSITION;
-        public float maxTorque = 100f;
-        public float maxVelocity = 10f;
+        public float maxTorque = 50f;
+        public float maxVelocity = 5f;
+        public float maxDeltaPosition = 0.1f;
         
         // PD 제어
-        public float kp = 100f;
-        public float kd = 10f;
-        public float damping = 0.99f;
+        public float kp = 50f;
+        public float kd = 5f;
+        public float damping = 0.95f;
         
-        // 보상 가중치
-        public float aliveBonus = 0.5f;
-        public float forwardWeight = 1.0f;
+        // 보상
+        public float aliveBonus = 0.1f;
+        public float heightRewardWeight = 1.0f;
         public float speedMatchWeight = 0.5f;
-        public float controlCostWeight = 0.1f;
-        public float healthyReward = 0.2f;
-        public float velocityPenaltyWeight = 0.01f;
+        public float controlCostWeight = 0.01f;
+        public float velocityPenaltyWeight = 0.001f;
+        public float symmetryRewardWeight = 0.1f;
         
         // 목표
-        public float targetSpeed = 1.0f;        // m/s
+        public float targetHeight = 1.0f;
+        public float targetSpeed = 0f;  // 0 = 정지 유지
         
         // 종료 조건
         public boolean terminateOnFall = true;
         public float minHeight = 0.3f;
         public float maxHeight = 2.0f;
-        public float maxTilt = 1.0f;            // ~57도
         
         // 초기화
         public boolean randomizeInitial = true;
-        public float initNoiseScale = 0.1f;
+        public float initNoiseScale = 0.05f;
     }
     
-    // ========== 유틸리티 ==========
-    
     /**
-     * float 배열을 바이트로 변환
+     * 통계
      */
-    public static byte[] floatsToBytes(float[] floats) {
-        ByteBuffer buffer = ByteBuffer.allocate(floats.length * 4);
-        for (float f : floats) {
-            buffer.putFloat(f);
+    public static class Statistics {
+        private final List<Float> episodeRewards = new ArrayList<>();
+        private final List<Integer> episodeLengths = new ArrayList<>();
+        private float bestReward = Float.NEGATIVE_INFINITY;
+        private int totalSteps = 0;
+        
+        public void recordEpisode(float reward, int length) {
+            episodeRewards.add(reward);
+            episodeLengths.add(length);
+            totalSteps += length;
+            if (reward > bestReward) bestReward = reward;
+            
+            // 최근 100개만 유지
+            while (episodeRewards.size() > 100) {
+                episodeRewards.remove(0);
+                episodeLengths.remove(0);
+            }
         }
-        return buffer.array();
+        
+        public float getAverageReward() {
+            if (episodeRewards.isEmpty()) return 0;
+            float sum = 0;
+            for (float r : episodeRewards) sum += r;
+            return sum / episodeRewards.size();
+        }
+        
+        public float getAverageLength() {
+            if (episodeLengths.isEmpty()) return 0;
+            int sum = 0;
+            for (int l : episodeLengths) sum += l;
+            return (float) sum / episodeLengths.size();
+        }
+        
+        public float getBestReward() { return bestReward; }
+        public int getTotalSteps() { return totalSteps; }
+        public int getEpisodeCount() { return episodeRewards.size(); }
+        
+        public List<Float> getRecentRewards(int n) {
+            int start = Math.max(0, episodeRewards.size() - n);
+            return new ArrayList<>(episodeRewards.subList(start, episodeRewards.size()));
+        }
+    }
+    
+    // ========== 내장 에이전트 ==========
+    
+    /**
+     * 간단한 내장 에이전트
+     */
+    public class SimpleAgent {
+        private int actionDim;
+        private Random random = new Random();
+        
+        // 경험 버퍼 (간단한 Policy Gradient용)
+        private List<Experience> experiences = new ArrayList<>();
+        private static final int BUFFER_SIZE = 2048;
+        
+        // 간단한 선형 정책 (학습용)
+        private float[][] weights;  // [obsDim x actDim]
+        private float learningRate = 0.001f;
+        
+        // VMD 목표 (모방 학습용)
+        private float[] imitationTargets;
+        
+        public void initialize(int actionDim) {
+            this.actionDim = actionDim;
+            
+            int obsDim = getObservationDim();
+            weights = new float[obsDim][actionDim];
+            
+            // Xavier 초기화
+            float scale = (float) Math.sqrt(2.0 / (obsDim + actionDim));
+            for (int i = 0; i < obsDim; i++) {
+                for (int j = 0; j < actionDim; j++) {
+                    weights[i][j] = (random.nextFloat() - 0.5f) * 2 * scale;
+                }
+            }
+        }
+        
+        /**
+         * 행동 선택
+         */
+        public float[] selectAction(float[] observation, AgentMode mode) {
+            switch (mode) {
+                case RANDOM:
+                    return randomAction();
+                    
+                case LEARNING:
+                case INFERENCE:
+                    return policyAction(observation, mode == AgentMode.LEARNING);
+                    
+                case IMITATION:
+                    return imitationAction(observation);
+                    
+                case MANUAL:
+                default:
+                    return zeroAction();
+            }
+        }
+        
+        private float[] randomAction() {
+            float[] action = new float[actionDim];
+            for (int i = 0; i < actionDim; i++) {
+                action[i] = random.nextFloat() * 2 - 1; // [-1, 1]
+            }
+            return action;
+        }
+        
+        private float[] zeroAction() {
+            return new float[actionDim];
+        }
+        
+        private float[] policyAction(float[] obs, boolean explore) {
+            float[] action = new float[actionDim];
+            
+            // 선형 정책: action = obs * weights
+            for (int j = 0; j < actionDim; j++) {
+                float sum = 0;
+                for (int i = 0; i < obs.length && i < weights.length; i++) {
+                    sum += obs[i] * weights[i][j];
+                }
+                action[j] = (float) Math.tanh(sum); // [-1, 1]
+                
+                // 탐색 노이즈
+                if (explore) {
+                    action[j] += random.nextGaussian() * 0.2f;
+                    action[j] = clamp(action[j], -1f, 1f);
+                }
+            }
+            
+            return action;
+        }
+        
+        private float[] imitationAction(float[] obs) {
+            // VMD 목표가 있으면 그쪽으로
+            if (imitationTargets != null && imitationTargets.length == actionDim) {
+                float[] action = new float[actionDim];
+                for (int i = 0; i < actionDim; i++) {
+                    // 현재 위치와 목표의 차이를 행동으로
+                    JointState js = jointStates.get(i);
+                    float target = imitationTargets[i];
+                    float error = target - js.position;
+                    action[i] = clamp(error * 5f, -1f, 1f); // P 제어
+                }
+                return action;
+            }
+            return zeroAction();
+        }
+        
+        /**
+         * 경험 저장
+         */
+        public void storeExperience(float[] obs, float[] action, float reward, float[] nextObs, boolean done) {
+            experiences.add(new Experience(obs.clone(), action.clone(), reward, nextObs.clone(), done));
+            
+            if (experiences.size() > BUFFER_SIZE) {
+                experiences.remove(0);
+            }
+        }
+        
+        /**
+         * 정책 업데이트 (간단한 REINFORCE)
+         */
+        public void update() {
+            if (experiences.size() < 64) return;
+            
+            // 보상 정규화
+            float meanReward = 0;
+            for (Experience e : experiences) meanReward += e.reward;
+            meanReward /= experiences.size();
+            
+            float stdReward = 0;
+            for (Experience e : experiences) {
+                stdReward += (e.reward - meanReward) * (e.reward - meanReward);
+            }
+            stdReward = (float) Math.sqrt(stdReward / experiences.size() + 1e-8);
+            
+            // Policy Gradient 업데이트
+            for (Experience e : experiences) {
+                float advantage = (e.reward - meanReward) / stdReward;
+                
+                // 그래디언트: d log π(a|s) * advantage
+                for (int j = 0; j < actionDim && j < e.action.length; j++) {
+                    for (int i = 0; i < e.obs.length && i < weights.length; i++) {
+                        // 간단한 업데이트: tanh 출력이므로 gradient ≈ action * (1 - action^2)
+                        float actionGrad = e.action[j] * (1 - e.action[j] * e.action[j]);
+                        weights[i][j] += learningRate * advantage * e.obs[i] * actionGrad;
+                    }
+                }
+            }
+            
+            // 버퍼 클리어
+            experiences.clear();
+            
+            log("Policy updated (lr=" + learningRate + ")");
+        }
+        
+        /**
+         * VMD 모방 목표 설정
+         */
+        public void setImitationTargets(float[] targets) {
+            this.imitationTargets = targets;
+        }
+        
+        /**
+         * 모방 목표 설정 (관절 이름 -> 값 맵)
+         */
+        public void setImitationTargets(Map<String, Float> targetMap) {
+            imitationTargets = new float[actionDim];
+            for (int i = 0; i < jointStates.size(); i++) {
+                String name = jointStates.get(i).name;
+                imitationTargets[i] = targetMap.getOrDefault(name, jointStates.get(i).position);
+            }
+        }
+        
+        private class Experience {
+            float[] obs, action, nextObs;
+            float reward;
+            boolean done;
+            
+            Experience(float[] obs, float[] action, float reward, float[] nextObs, boolean done) {
+                this.obs = obs;
+                this.action = action;
+                this.reward = reward;
+                this.nextObs = nextObs;
+                this.done = done;
+            }
+        }
     }
     
     /**
-     * 바이트를 float 배열로 변환
+     * 내장 에이전트 접근
      */
-    public static float[] bytesToFloats(byte[] bytes) {
-        FloatBuffer buffer = ByteBuffer.wrap(bytes).asFloatBuffer();
-        float[] floats = new float[bytes.length / 4];
-        buffer.get(floats);
-        return floats;
+    public SimpleAgent getAgent() {
+        return agent;
     }
 }
