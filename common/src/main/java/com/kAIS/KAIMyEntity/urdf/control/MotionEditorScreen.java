@@ -3,6 +3,7 @@ package com.kAIS.KAIMyEntity.urdf.control;
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.kAIS.KAIMyEntity.urdf.vmd.VMDLoader;
 import com.kAIS.KAIMyEntity.webots.WebotsController;
+import com.kAIS.KAIMyEntity.rl.RLEnvironmentCore;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
@@ -54,6 +55,7 @@ public final class MotionEditorScreen {
 
         private final Screen parent;
         private final URDFModelOpenGLWithSTL renderer;
+        private RLEnvironmentCore rlEnv;
 
         private SimState simState = SimState.STOPPED;
         private float simTime = 0f;
@@ -91,6 +93,12 @@ public final class MotionEditorScreen {
             super(Component.literal("RL Control Panel"));
             this.parent = parent;
             this.renderer = renderer;
+            
+            // RL 환경 초기화
+            this.rlEnv = RLEnvironmentCore.getInstance();
+            this.rlEnv.initialize(renderer);
+            this.rlEnv.setLogCallback(msg -> log(LogLevel.INFO, msg));
+            
             loadJoints();
             log(LogLevel.INFO, "RL Control Panel opened");
         }
@@ -218,43 +226,65 @@ public final class MotionEditorScreen {
         }
 
         private int renderRLSection(GuiGraphics g, int x, int y, int w, int mx, int my) {
-            g.drawString(font, "Server:", x, y + 4, COL_TEXT_DIM, false);
-            String srvStatus = serverRunning ? "Running" : "Stopped";
-            int srvColor = serverRunning ? COL_ACCENT : COL_TEXT_DIM;
-            g.drawString(font, srvStatus, x + 50, y + 4, srvColor, false);
-            y += LINE_H + 4;
-
-            g.drawString(font, "Port:", x, y + 4, COL_TEXT_DIM, false);
-            int inputX = x + 40;
-            int inputW = 60;
-            boolean portHover = isInside(mx, my, inputX, y, inputW, BTN_H);
-            fillRect(g, inputX, y, inputW, BTN_H, editingPort ? COL_BG_ACTIVE : (portHover ? COL_BG_HOVER : COL_BG_ITEM));
-            drawBorder(g, inputX, y, inputW, BTN_H, editingPort ? COL_ACCENT : COL_BORDER);
-            String portText = editingPort ? portBuffer.toString() + "_" : serverPort;
-            g.drawString(font, portText, inputX + 4, y + 4, COL_TEXT, false);
-            buttonBounds.put("port_input", new int[]{inputX, y, inputW, BTN_H});
-
-            String btnText = serverRunning ? "Stop" : "Start";
-            renderButton(g, inputX + inputW + 8, y, 50, BTN_H, btnText, "server_toggle", mx, my, serverRunning);
-            y += BTN_H + 8;
-
-            g.drawString(font, "Python:", x, y, COL_TEXT_DIM, false);
-            String pyStatus = pythonConnected ? "Connected" : "Waiting...";
-            int pyColor = pythonConnected ? COL_ACCENT : COL_WARNING;
-            g.drawString(font, pyStatus, x + 50, y, pyColor, false);
+            if (rlEnv == null || !rlEnv.isInitialized()) {
+                g.drawString(font, "RL Env: Not initialized", x, y, COL_WARNING, false);
+                return y + LINE_H;
+            }
+            
+            // 모드 선택 버튼
+            g.drawString(font, "Mode:", x, y + 4, COL_TEXT_DIM, false);
+            int bx = x + 40;
+            var mode = rlEnv.getAgentMode();
+            
+            bx = renderButton(g, bx, y, 35, BTN_H, "MAN", "mode_manual", mx, my, 
+                mode == RLEnvironmentCore.AgentMode.MANUAL);
+            bx = renderButton(g, bx + 2, y, 35, BTN_H, "RND", "mode_random", mx, my,
+                mode == RLEnvironmentCore.AgentMode.RANDOM);
+            bx = renderButton(g, bx + 2, y, 35, BTN_H, "LRN", "mode_learn", mx, my,
+                mode == RLEnvironmentCore.AgentMode.LEARNING);
+            bx = renderButton(g, bx + 2, y, 35, BTN_H, "IMI", "mode_imitate", mx, my,
+                mode == RLEnvironmentCore.AgentMode.IMITATION);
+            y += BTN_H + 6;
+            
+            // 학습 상태
+            boolean training = rlEnv.isTraining();
+            g.drawString(font, "Status:", x, y + 4, COL_TEXT_DIM, false);
+            String statusText = training ? "Training" : "Stopped";
+            int statusColor = training ? COL_ACCENT : COL_TEXT_DIM;
+            g.drawString(font, statusText, x + 50, y + 4, statusColor, false);
+            
+            // Start/Stop 버튼
+            String btnText = training ? "Stop" : "Start";
+            renderButton(g, x + 110, y, 50, BTN_H, btnText, "training_toggle", mx, my, training);
+            y += BTN_H + 6;
+            
+            // 에피소드 정보
+            var stats = rlEnv.getStats();
+            g.drawString(font, String.format("Episode: %d", rlEnv.getEpisodeCount()), x, y, COL_TEXT_DIM, false);
+            g.drawString(font, String.format("Step: %d", rlEnv.getStepCount()), x + 90, y, COL_TEXT_DIM, false);
             y += LINE_H;
-
-            g.drawString(font, String.format("Episode: %.2f", episodeReward), x, y, COL_TEXT_DIM, false);
-            y += LINE_H;
-
+            
+            // 보상 정보
             int rewardColor = lastReward > 0 ? COL_ACCENT : (lastReward < 0 ? COL_ERROR : COL_TEXT);
-            g.drawString(font, "Step: ", x, y, COL_TEXT_DIM, false);
-            g.drawString(font, String.format("%.4f", lastReward), x + 35, y, rewardColor, false);
+            g.drawString(font, String.format("Reward: %.2f", rlEnv.getEpisodeReward()), x, y, COL_TEXT_DIM, false);
+            g.drawString(font, String.format("(%.4f)", lastReward), x + 85, y, rewardColor, false);
             y += LINE_H;
-
-            int obsDim = joints.size() * 2;
-            int actDim = joints.size();
-            g.drawString(font, String.format("Obs: %d  Act: %d", obsDim, actDim), x, y, COL_TEXT_DIM, false);
+            
+            // 통계
+            g.drawString(font, String.format("Avg: %.2f  Best: %.2f", 
+                stats.getAverageReward(), stats.getBestReward()), x, y, COL_TEXT_DIM, false);
+            y += LINE_H;
+            
+            // 건강 상태
+            boolean healthy = rlEnv.isHealthy();
+            g.drawString(font, "Health: ", x, y, COL_TEXT_DIM, false);
+            g.drawString(font, healthy ? "OK" : "FALLEN", x + 45, y, healthy ? COL_ACCENT : COL_ERROR, false);
+            y += LINE_H;
+            
+            // 공간 정보
+            g.drawString(font, String.format("Obs: %d  Act: %d", 
+                rlEnv.getObservationDim(), rlEnv.getActionDim()), x, y, COL_TEXT_DIM, false);
+            
             return y + LINE_H;
         }
 
@@ -558,6 +588,27 @@ public final class MotionEditorScreen {
                 case "port_input" -> startPortEdit();
                 case "joint_scroll_up" -> { if (jointScrollOffset > 0) jointScrollOffset--; }
                 case "joint_scroll_down" -> { if (jointScrollOffset < joints.size() - MAX_VISIBLE_JOINTS) jointScrollOffset++; }
+                case "mode_manual" -> {
+                    if (rlEnv != null) rlEnv.setAgentMode(RLEnvironmentCore.AgentMode.MANUAL);
+                }
+                case "mode_random" -> {
+                    if (rlEnv != null) rlEnv.setAgentMode(RLEnvironmentCore.AgentMode.RANDOM);
+                }
+                case "mode_learn" -> {
+                    if (rlEnv != null) rlEnv.setAgentMode(RLEnvironmentCore.AgentMode.LEARNING);
+                }
+                case "mode_imitate" -> {
+                    if (rlEnv != null) rlEnv.setAgentMode(RLEnvironmentCore.AgentMode.IMITATION);
+                }
+                case "training_toggle" -> {
+                    if (rlEnv != null) {
+                        if (rlEnv.isTraining()) {
+                            rlEnv.stopTraining();
+                        } else {
+                            rlEnv.startTraining(rlEnv.getAgentMode());
+                        }
+                    }
+                }
             }
         }
 
@@ -602,18 +653,30 @@ public final class MotionEditorScreen {
             stepCount = 0;
             episodeReward = 0f;
             lastReward = 0f;
+            
             VMDPlayer.getInstance().stop();
             loadJoints();
-            log(LogLevel.INFO, "Simulation reset");
+            
+            // RL 환경 리셋
+            if (rlEnv != null && rlEnv.isInitialized()) {
+                rlEnv.reset();
+            }
+            
+            log(LogLevel.INFO, "Environment reset");
         }
 
         private void step() {
             if (simState == SimState.RUNNING) return;
-            stepCount++;
+            
+            // RL 환경 수동 스텝
+            if (rlEnv != null && rlEnv.isInitialized()) {
+                rlEnv.manualStep();
+                stepCount = rlEnv.getStepCount();
+                episodeReward = rlEnv.getEpisodeReward();
+                lastReward = rlEnv.getLastReward();
+            }
+            
             simTime += 0.05f;
-            lastReward = (float) (Math.random() * 0.2 - 0.1);
-            episodeReward += lastReward;
-            log(LogLevel.DEBUG, String.format("Step %d: reward=%.4f", stepCount, lastReward));
         }
 
         private void openVmdDialog() {
@@ -633,10 +696,34 @@ public final class MotionEditorScreen {
         @Override
         public void tick() {
             super.tick();
+            
+            // RL 환경 틱
+            if (rlEnv != null && rlEnv.isInitialized()) {
+                rlEnv.tick(0.05f); // 50ms per tick
+                
+                // 상태 동기화
+                episodeReward = rlEnv.getEpisodeReward();
+                lastReward = rlEnv.getLastReward();
+                stepCount = rlEnv.getStepCount();
+            }
+            
+            // VMD 재생 중이면 모방 목표 설정
+            var vmd = VMDPlayer.getInstance();
+            if (vmd.isPlaying() && rlEnv != null && rlEnv.getAgent() != null) {
+                Map<String, Float> targets = new HashMap<>();
+                // VMD 현재 포즈를 목표로 설정
+                for (var entry : joints.entrySet()) {
+                    targets.put(entry.getKey(), entry.getValue().value);
+                }
+                rlEnv.getAgent().setImitationTargets(targets, rlEnv.getJointNames());
+            }
+            
             if (simState == SimState.RUNNING) {
                 simTime += 0.05f * simSpeed;
                 stepCount++;
             }
+            
+            // 관절 상태 동기화
             var robot = renderer.getRobotModel();
             if (robot != null && robot.joints != null) {
                 for (var joint : robot.joints) {
